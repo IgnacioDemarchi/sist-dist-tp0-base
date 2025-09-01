@@ -1,3 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+OUT="${1:-docker-compose-dev.yaml}"
+N="${2:-5}"
+
+cat > "$OUT" <<'YAML'
 name: tp0
 services:
   server:
@@ -8,36 +14,29 @@ services:
       - PYTHONUNBUFFERED=1
       - LOGGING_LEVEL=DEBUG
     networks: [testing_net]
-  client1:
-    container_name: client1
+YAML
+
+for i in $(seq 1 "$N"); do
+cat >> "$OUT" <<YAML
+  client$i:
+    container_name: client$i
     image: client:latest
     entrypoint: /client
     environment:
-      - CLI_ID=1
+      - CLI_ID=$i
       - CLI_LOG_LEVEL=DEBUG
     networks: [testing_net]
     depends_on: [server]
-  client2:
-    container_name: client2
-    image: client:latest
-    entrypoint: /client
-    environment:
-      - CLI_ID=2
-      - CLI_LOG_LEVEL=DEBUG
-    networks: [testing_net]
-    depends_on: [server]
-  client3:
-    container_name: client3
-    image: client:latest
-    entrypoint: /client
-    environment:
-      - CLI_ID=3
-      - CLI_LOG_LEVEL=DEBUG
-    networks: [testing_net]
-    depends_on: [server]
+YAML
+done
+
+cat >> "$OUT" <<'YAML'
 networks:
   testing_net:
     ipam:
       driver: default
       config:
         - subnet: 172.25.125.0/24
+YAML
+
+echo "Generated $OUT with $N clients."
