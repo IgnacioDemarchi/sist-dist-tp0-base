@@ -12,7 +12,6 @@ services:
     entrypoint: python3 /main.py
     environment:
       - PYTHONUNBUFFERED=1
-      - LOGGING_LEVEL=INFO
     volumes:
       - ./server/config.ini:/config.ini:ro
     networks: [testing_net]
@@ -26,7 +25,6 @@ cat >> "$OUT" <<YAML
     entrypoint: /client
     environment:
       - CLI_ID=$i
-      - CLI_LOG_LEVEL=DEBUG
     volumes:
       - ./client/config.yaml:/config.yaml:ro
     networks: [testing_net]
