@@ -6,7 +6,6 @@ services:
     entrypoint: python3 /main.py
     environment:
       - PYTHONUNBUFFERED=1
-      - LOGGING_LEVEL=INFO
     volumes:
       - ./server/config.ini:/config.ini:ro
     networks: [testing_net]
@@ -16,7 +15,6 @@ services:
     entrypoint: /client
     environment:
       - CLI_ID=1
-      - CLI_LOG_LEVEL=INFO
     volumes:
       - ./client/config.yaml:/config.yaml:ro
     networks: [testing_net]
