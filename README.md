@@ -1,26 +1,34 @@
-### Ejercicio 2 – Montaje de configuraciones con volúmenes
+### Ejercicio 3 – Prueba del servidor Echo
 
-En este ejercicio se amplió el script `generar-compose.sh` para incluir el montaje de archivos de configuración en el contenedor del servidor y de los clientes mediante volúmenes.  
+En este ejercicio se desarrolló un script en **Shell** (`test_echo_server.sh`) que valida el correcto funcionamiento del servidor echo desplegado con `docker-compose`.  
 
 #### Ejecución
 
 ```bash
-./generar-compose.sh [archivo_salida] [n_clientes]
+./test_echo_server.sh [host] [port] [mensaje]
 ```
 
-- **archivo_salida**: nombre del archivo de salida (por defecto `docker-compose-dev.yaml`)  
-- **n_clientes**: cantidad de clientes a generar (por defecto `5`)  
+- **host**: nombre del contenedor o servicio del servidor (por defecto `server`)  
+- **port**: puerto en el que escucha el servidor (por defecto `12345`)  
+- **mensaje**: texto a enviar al servidor (por defecto se genera automáticamente con PID y timestamp)  
 
 Ejemplo:
 
 ```bash
-./generar-compose.sh docker-compose-dev.yaml 3
+./test_echo_server.sh server 12345 "hola mundo"
 ```
 
 #### Detalles importantes de la solución
 
-- El servicio `server` monta el archivo `./server/config.ini` en el contenedor, en modo **solo lectura**, para centralizar su configuración.  
-- Cada cliente monta `./client/config.yaml` también en modo **solo lectura**, de forma que todos acceden a la misma configuración base.  
-- Se mantiene la lógica de generación dinámica de clientes con identificadores (`CLI_ID`).  
-- La red `testing_net` con **subnet** fijo sigue asegurando conectividad controlada entre los contenedores.  
-- Al usar volúmenes se facilita modificar la configuración sin necesidad de reconstruir imágenes.  
+- El script detecta automáticamente la red a la que está conectado el servidor a través de `docker inspect`.  
+- Se ejecuta un contenedor temporal de **BusyBox** en esa red para enviar el mensaje mediante `nc`.  
+- Se usa un timeout configurable (`NC_TIMEOUT`, por defecto `3s`) para evitar bloqueos.  
+- El mensaje de respuesta se compara con el original (ignorando saltos de línea).  
+- Si el servidor responde correctamente, se imprime:  
+  ```
+  action: test_echo_server | result: success
+  ```  
+  En caso contrario, se imprime:  
+  ```
+  action: test_echo_server | result: fail
+  ```  
