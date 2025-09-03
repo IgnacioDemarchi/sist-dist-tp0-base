@@ -1,9 +1,9 @@
 package common
 
 import (
-	"bufio"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	"github.com/op/go-logging"
@@ -64,6 +64,15 @@ func (c *Client) createClientSocket() error {
 
 // StartClientLoop Send messages to the client until some time threshold is met
 func (c *Client) StartClientLoop() {
+
+	nombre := os.Getenv("NOMBRE")
+	apellido := os.Getenv("APELLIDO")
+	dni := os.Getenv("DOCUMENTO")
+	nacimiento := os.Getenv("NACIMIENTO")
+	num := 0
+	if v := os.Getenv("NUMERO"); v != "" {
+		fmt.Sscanf(v, "%d", &num)
+	}
 	// There is an autoincremental msgID to identify every message sent
 	// Messages if the message amount threshold has not been surpassed
 	for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
@@ -76,37 +85,30 @@ func (c *Client) StartClientLoop() {
 		}
 
 		// Create the connection the server in every loop iteration. Send an
-		c.createClientSocket()
-
-		// Write full line (avoid short-writes)
-		bw := bufio.NewWriter(c.conn)
-		line := fmt.Sprintf("[CLIENT %v] Message N°%v\n", c.config.ID, msgID)
-		if _, err := bw.WriteString(line); err != nil {
-			log.Errorf("action: send_message | result: fail | client_id: %v | error: %v", c.config.ID, err)
-			_ = c.conn.Close()
-			return
-		}
-		if err := bw.Flush(); err != nil {
-			log.Errorf("action: send_message | result: fail | client_id: %v | error: %v", c.config.ID, err)
-			_ = c.conn.Close()
+		if err := c.createClientSocket(); err != nil {
 			return
 		}
 
-		msg, err := bufio.NewReader(c.conn).ReadString('\n')
-		c.conn.Close()
+		bet := &Bet{
+			AgencyID:   c.config.ID,
+			Nombre:     nombre,
+			Apellido:   apellido,
+			Documento:  dni,
+			Nacimiento: nacimiento,
+			Numero:     num,
+		}
 
-		if err != nil {
-			log.Errorf("action: receive_message | result: fail | client_id: %v | error: %v",
-				c.config.ID,
-				err,
-			)
+		ack, err := SendBet(c.conn, bet)
+		_ = c.conn.Close()
+		if err != nil || !ack.OK {
+			if err == nil {
+				err = fmt.Errorf(ack.Error)
+			}
+			log.Errorf("action: apuesta_enviada | result: fail | dni: %s | numero: %d | error: %v", dni, num, err)
 			return
 		}
 
-		log.Infof("action: receive_message | result: success | client_id: %v | msg: %v",
-			c.config.ID,
-			msg,
-		)
+		log.Infof("action: apuesta_enviada | result: success | dni: %s | numero: %d", dni, num)
 
 		// Interruptible sleep so SIGTERM doesn’t wait a full period
 		timer := time.NewTimer(c.config.LoopPeriod)

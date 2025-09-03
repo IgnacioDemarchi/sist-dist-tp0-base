@@ -1,7 +1,7 @@
 import socket
 import logging
-
-
+from common.comm import recv_json, send_json 
+from common.utils import Bet, store_bets
 class Server:
     def __init__(self, port, listen_backlog):
         # Initialize server socket
@@ -29,26 +29,59 @@ class Server:
 
     def __handle_client_connection(self, client_sock):
         """
-        Read a full line (until '\n') from the client and echo it back.
-        Always send all bytes back (no short-writes).
+        Receive length-prefixed JSON frames.
+        Accept BET messages, persist them, ACK, and keep going
+        until client closes connection.
         """
         try:
-            # robust receive: keep reading until newline or EOF
-            data = bytearray()
-            while b'\n' not in data:
-                chunk = client_sock.recv(4096)
-                if not chunk:
+            while True:
+                try:
+                    msg = recv_json(client_sock)
+                except EOFError:
+                    break  # client closed
+                except Exception as e:
+                    logging.error(f"action: recv | result: fail | error: {e}")
                     break
-                data.extend(chunk)
 
-            msg = bytes(data).rstrip(b'\r\n').decode('utf-8', errors='replace')
-            addr = client_sock.getpeername()
-            logging.info(f'action: receive_message | result: success | ip: {addr[0]} | msg: {msg}')
+                mtype = msg.get("type")
+                if mtype != "BET":
+                    # Unknown or missing type → negative ACK
+                    try:
+                        send_json(client_sock, {"type": "ACK", "ok": False, "error": "unknown message type"})
+                    except Exception:
+                        pass
+                    continue
 
-            # robust send: sendall avoids short-writes
-            client_sock.sendall((msg + "\n").encode('utf-8'))
+                # Map fields from client payload to Bet(...)
+                try:
+                    bet = Bet(
+                        agency=msg.get("agency_id", "0"),
+                        first_name=msg.get("nombre", ""),
+                        last_name=msg.get("apellido", ""),
+                        document=msg.get("documento", ""),
+                        birthdate=msg.get("nacimiento", "1970-01-01"),
+                        number=str(msg.get("numero", 0)),
+                    )
+                    store_bets([bet])
+
+                    logging.info(
+                        f"action: apuesta_almacenada | result: success | dni: {bet.document} | numero: {bet.number}"
+                    )
+
+                    send_json(client_sock, {"type": "ACK", "ok": True})
+
+                except Exception as e:
+                    logging.error(
+                        f"action: apuesta_almacenada | result: fail | dni: {msg.get('documento','')} "
+                        f"| numero: {msg.get('numero',0)} | error: {e}"
+                    )
+                    try:
+                        send_json(client_sock, {"type": "ACK", "ok": False, "error": str(e)})
+                    except Exception:
+                        pass
+
         except OSError as e:
-            logging.error(f"action: receive_message | result: fail | error: {e}")
+            logging.error(f"action: client_handler | result: fail | error: {e}")
         finally:
             try:
                 client_sock.close()
