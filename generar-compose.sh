@@ -25,6 +25,11 @@ cat >> "$OUT" <<YAML
     entrypoint: /client
     environment:
       - CLI_ID=$i
+      - NOMBRE=Juan$i
+      - APELLIDO=Perez$i
+      - DOCUMENTO=$((10000000 + RANDOM % 90000000))
+      - NACIMIENTO=1990-01-01
+      - NUMERO=$((RANDOM % 10000))
     volumes:
       - ./client/config.yaml:/config.yaml:ro
     networks: [testing_net]
