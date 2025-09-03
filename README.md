@@ -1,34 +1,33 @@
-### Ejercicio 3 – Prueba del servidor Echo
+### Ejercicio 4 – Finalización graceful con SIGTERM
 
-En este ejercicio se desarrolló un script en **Shell** (`test_echo_server.sh`) que valida el correcto funcionamiento del servidor echo desplegado con `docker-compose`.  
+En este ejercicio se modificaron **cliente** y **servidor** para que ambos finalicen de manera *graceful* al recibir la señal `SIGTERM`.  
+Finalizar de forma graceful implica cerrar correctamente todos los *file descriptors* (sockets, conexiones, etc.) antes de que el proceso principal termine.  
 
 #### Ejecución
 
-```bash
-./test_echo_server.sh [host] [port] [mensaje]
-```
-
-- **host**: nombre del contenedor o servicio del servidor (por defecto `server`)  
-- **port**: puerto en el que escucha el servidor (por defecto `12345`)  
-- **mensaje**: texto a enviar al servidor (por defecto se genera automáticamente con PID y timestamp)  
-
-Ejemplo:
+El cliente y servidor se ejecutan normalmente con `docker-compose`. Para probar la finalización graceful:  
 
 ```bash
-./test_echo_server.sh server 12345 "hola mundo"
+docker compose up
+docker compose down -t 5
 ```
+
+El flag `-t` indica el tiempo de espera (en segundos) para que los contenedores reciban la señal `SIGTERM` y finalicen de forma ordenada antes de forzar un `SIGKILL`.  
 
 #### Detalles importantes de la solución
 
-- El script detecta automáticamente la red a la que está conectado el servidor a través de `docker inspect`.  
-- Se ejecuta un contenedor temporal de **BusyBox** en esa red para enviar el mensaje mediante `nc`.  
-- Se usa un timeout configurable (`NC_TIMEOUT`, por defecto `3s`) para evitar bloqueos.  
-- El mensaje de respuesta se compara con el original (ignorando saltos de línea).  
-- Si el servidor responde correctamente, se imprime:  
-  ```
-  action: test_echo_server | result: success
-  ```  
-  En caso contrario, se imprime:  
-  ```
-  action: test_echo_server | result: fail
-  ```  
+- **Cliente (Go):**
+  - Se añadió un `signal.Notify` que captura `SIGINT` y `SIGTERM`.  
+  - Al recibir la señal, se invoca `client.Close()`, que:
+    - Cierra el canal `stopCh` para indicar la detención del loop.  
+    - Cierra el socket activo para desbloquear cualquier `read/write`.  
+  - Los mensajes de log confirman el cierre del loop y de la conexión.  
+
+- **Servidor (Python):**
+  - Se registraron handlers para `SIGTERM` y `SIGINT`.  
+  - En el handler se llama a `server.stop()`, que:
+    - Cierra el socket de escucha.  
+    - Marca la bandera `_stopping` para salir del loop principal.  
+  - El servidor loguea el inicio y éxito del proceso de cierre.  
+
+- Ambos sistemas reportan en logs la finalización de recursos al recibir la señal, garantizando un cierre controlado y evitando fugas de recursos.  
