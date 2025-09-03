@@ -17,71 +17,12 @@ services:
       - CLI_ID=1
       - NOMBRE=Juan1
       - APELLIDO=Perez1
-      - DOCUMENTO=10010348
+      - DOCUMENTO=10007358
       - NACIMIENTO=1990-01-01
-      - NUMERO=6148
+      - NUMERO=7177
     volumes:
       - ./client/config.yaml:/config.yaml:ro
-    networks: [testing_net]
-    depends_on: [server]
-  client2:
-    container_name: client2
-    image: client:latest
-    entrypoint: /client
-    environment:
-      - CLI_ID=2
-      - NOMBRE=Juan2
-      - APELLIDO=Perez2
-      - DOCUMENTO=10003413
-      - NACIMIENTO=1990-01-01
-      - NUMERO=3414
-    volumes:
-      - ./client/config.yaml:/config.yaml:ro
-    networks: [testing_net]
-    depends_on: [server]
-  client3:
-    container_name: client3
-    image: client:latest
-    entrypoint: /client
-    environment:
-      - CLI_ID=3
-      - NOMBRE=Juan3
-      - APELLIDO=Perez3
-      - DOCUMENTO=10013942
-      - NACIMIENTO=1990-01-01
-      - NUMERO=3293
-    volumes:
-      - ./client/config.yaml:/config.yaml:ro
-    networks: [testing_net]
-    depends_on: [server]
-  client4:
-    container_name: client4
-    image: client:latest
-    entrypoint: /client
-    environment:
-      - CLI_ID=4
-      - NOMBRE=Juan4
-      - APELLIDO=Perez4
-      - DOCUMENTO=10022338
-      - NACIMIENTO=1990-01-01
-      - NUMERO=574
-    volumes:
-      - ./client/config.yaml:/config.yaml:ro
-    networks: [testing_net]
-    depends_on: [server]
-  client5:
-    container_name: client5
-    image: client:latest
-    entrypoint: /client
-    environment:
-      - CLI_ID=5
-      - NOMBRE=Juan5
-      - APELLIDO=Perez5
-      - DOCUMENTO=10029011
-      - NACIMIENTO=1990-01-01
-      - NUMERO=6561
-    volumes:
-      - ./client/config.yaml:/config.yaml:ro
+      - ./data:/data:ro
     networks: [testing_net]
     depends_on: [server]
 networks:

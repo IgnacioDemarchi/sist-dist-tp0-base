@@ -1,7 +1,6 @@
 import json
 import socket
 import struct
-from common.comm import recv_json, send_json
 
 _MAX = 8 * 1024
 
