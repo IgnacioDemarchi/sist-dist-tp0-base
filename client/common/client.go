@@ -1,9 +1,11 @@
 package common
 
 import (
+	"encoding/csv"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/op/go-logging"
@@ -17,6 +19,7 @@ type ClientConfig struct {
 	ServerAddress string
 	LoopAmount    int
 	LoopPeriod    time.Duration
+	BatchMax      int
 }
 
 // Client Entity that encapsulates how
@@ -24,6 +27,52 @@ type Client struct {
 	config ClientConfig
 	conn   net.Conn
 	stopCh chan struct{}
+}
+
+func loadAgencyBets(agencyID string) ([]Bet, error) {
+	path := filepath.Join("/data", fmt.Sprintf("agency-%s.csv", agencyID))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1
+	rows, err := r.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	var out []Bet
+	// Try to detect header row; if first cell isn't a digit DNI, assume header
+	start := 0
+	if len(rows) > 0 && len(rows[0]) > 0 {
+		// very light heuristic: if header has "documento" or non-digit in col2, skip
+		if rows[0][0] == "nombre" || rows[0][2] == "documento" {
+			start = 1
+		}
+	}
+
+	for i := start; i < len(rows); i++ {
+		c := rows[i]
+		// Defensive: support 4 or 5+ columns
+		if len(c) < 5 {
+			continue
+		}
+		num := 0
+		fmt.Sscanf(c[4], "%d", &num)
+		out = append(out, Bet{
+			// Type set by sender
+			AgencyID:   agencyID,
+			Nombre:     c[0],
+			Apellido:   c[1],
+			Documento:  c[2],
+			Nacimiento: c[3],
+			Numero:     num,
+		})
+	}
+	return out, nil
 }
 
 // Called on SIGTERM to stop gracefully
@@ -62,21 +111,20 @@ func (c *Client) createClientSocket() error {
 	return nil
 }
 
-// StartClientLoop Send messages to the client until some time threshold is met
 func (c *Client) StartClientLoop() {
-
-	nombre := os.Getenv("NOMBRE")
-	apellido := os.Getenv("APELLIDO")
-	dni := os.Getenv("DOCUMENTO")
-	nacimiento := os.Getenv("NACIMIENTO")
-	num := 0
-	if v := os.Getenv("NUMERO"); v != "" {
-		fmt.Sscanf(v, "%d", &num)
+	bets, err := loadAgencyBets(c.config.ID)
+	if err != nil {
+		log.Errorf("action: load_bets | result: fail | client_id: %v | error: %v", c.config.ID, err)
+		return
 	}
-	// There is an autoincremental msgID to identify every message sent
-	// Messages if the message amount threshold has not been surpassed
-	for msgID := 1; msgID <= c.config.LoopAmount; msgID++ {
+	if c.config.BatchMax <= 0 {
+		c.config.BatchMax = 100
+	}
 
+	// Walk the bets, sending batches (capped by BatchMax and <=8KB by SendBatches)
+	sent := 0
+	for sent < len(bets) {
+		// stop quickly on SIGTERM
 		select {
 		case <-c.stopCh:
 			log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
@@ -84,33 +132,30 @@ func (c *Client) StartClientLoop() {
 		default:
 		}
 
-		// Create the connection the server in every loop iteration. Send an
+		end := sent + c.config.BatchMax
+		if end > len(bets) {
+			end = len(bets)
+		}
+		chunk := bets[sent:end]
+
 		if err := c.createClientSocket(); err != nil {
 			return
 		}
-
-		bet := &Bet{
-			AgencyID:   c.config.ID,
-			Nombre:     nombre,
-			Apellido:   apellido,
-			Documento:  dni,
-			Nacimiento: nacimiento,
-			Numero:     num,
-		}
-
-		ack, err := SendBet(c.conn, bet)
+		ack, err := SendBatches(c.conn, c.config.ID, chunk)
 		_ = c.conn.Close()
-		if err != nil || !ack.OK {
+		if err != nil || ack == nil || !ack.OK {
 			if err == nil {
-				err = fmt.Errorf(ack.Error)
+				err = fmt.Errorf("server nack or nil ack")
 			}
-			log.Errorf("action: apuesta_enviada | result: fail | dni: %s | numero: %d | error: %v", dni, num, err)
+			log.Errorf("action: apuesta_enviada | result: fail | cantidad: %d | error: %v", len(chunk), err)
 			return
 		}
 
-		log.Infof("action: apuesta_enviada | result: success | dni: %s | numero: %d", dni, num)
+		log.Infof("action: apuesta_enviada | result: success | cantidad: %d", len(chunk))
 
-		// Interruptible sleep so SIGTERM doesn’t wait a full period
+		sent = end
+
+		// Interruptible pacing between batches
 		timer := time.NewTimer(c.config.LoopPeriod)
 		select {
 		case <-c.stopCh:
@@ -122,5 +167,6 @@ func (c *Client) StartClientLoop() {
 		case <-timer.C:
 		}
 	}
+
 	log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
 }

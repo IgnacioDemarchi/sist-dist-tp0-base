@@ -43,6 +43,36 @@ class Server:
                     logging.error(f"action: recv | result: fail | error: {e}")
                     break
 
+                if msg.get("type") == "BATCH_BET":
+                    agency = msg.get("agency_id", "0")
+                    rows = msg.get("bets", [])
+                    count = len(rows)
+                    try:
+                        bets = []
+                        for b in rows:
+                            bet = Bet(
+                                agency=agency,
+                                first_name=b.get("nombre", ""),
+                                last_name=b.get("apellido", ""),
+                                document=b.get("documento", ""),
+                                birthdate=b.get("nacimiento", ""),
+                                number=str(b.get("numero", 0)),
+                            )
+                            bets.append(bet)
+
+                        # persist atomically
+                        store_bets(bets)
+
+                        logging.info(f"action: apuesta_recibida | result: success | cantidad: {count}")
+
+                        send_json(client_sock, {"type": "ACK_BATCH", "ok": True, "count": count})
+
+                    except Exception as e:
+                        logging.error(f"action: apuesta_recibida | result: fail | cantidad: {count} | error: {e}")
+                        send_json(client_sock, {"type": "ACK_BATCH", "ok": False, "count": count, "error": str(e)})
+                    continue
+
+
                 mtype = msg.get("type")
                 if mtype != "BET":
                     # Unknown or missing type → negative ACK

@@ -27,6 +27,7 @@ func InitConfig() (*viper.Viper, error) {
 
 	// Configure viper to read env variables with the CLI_ prefix
 	v.AutomaticEnv()
+	v.SetDefault("batch.maxAmount", 100) // adjust; we still cap by size
 	v.SetEnvPrefix("cli")
 	// Use a replacer to replace env variables underscores with points. This let us
 	// use nested configurations in the config file and at the same time define
@@ -110,6 +111,7 @@ func main() {
 		ID:            v.GetString("id"),
 		LoopAmount:    v.GetInt("loop.amount"),
 		LoopPeriod:    v.GetDuration("loop.period"),
+		BatchMax:      v.GetInt("batch.maxAmount"),
 	}
 
 	client := common.NewClient(clientConfig)
