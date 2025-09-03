@@ -13,6 +13,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - LOGGING_LEVEL=INFO
+    volumes:
+      - ./server/config.ini:/config.ini:ro
     networks: [testing_net]
 YAML
 
@@ -24,7 +26,9 @@ cat >> "$OUT" <<YAML
     entrypoint: /client
     environment:
       - CLI_ID=$i
-      - CLI_LOG_LEVEL=DEBUG
+      - CLI_LOG_LEVEL=INFO
+    volumes:
+      - ./client/config.yaml:/config.yaml:ro
     networks: [testing_net]
     depends_on: [server]
 YAML
