@@ -32,7 +32,7 @@ cat >> "$OUT" <<YAML
       - NUMERO=$((RANDOM % 10000))
     volumes:
       - ./client/config.yaml:/config.yaml:ro
-      - ./data:/data:ro
+      - ./.data:/data:ro
     networks: [testing_net]
     depends_on: [server]
 YAML

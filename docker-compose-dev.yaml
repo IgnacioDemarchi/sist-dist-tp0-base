@@ -17,9 +17,9 @@ services:
       - CLI_ID=1
       - NOMBRE=Juan1
       - APELLIDO=Perez1
-      - DOCUMENTO=10007358
+      - DOCUMENTO=10009686
       - NACIMIENTO=1990-01-01
-      - NUMERO=7177
+      - NUMERO=803
     volumes:
       - ./client/config.yaml:/config.yaml:ro
       - ./data:/data:ro
