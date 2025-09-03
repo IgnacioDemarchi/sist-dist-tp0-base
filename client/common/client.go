@@ -23,15 +23,26 @@ type ClientConfig struct {
 type Client struct {
 	config ClientConfig
 	conn   net.Conn
+	stopCh chan struct{}
+}
+
+// Called on SIGTERM to stop gracefully
+func (c *Client) Close() {
+	select {
+	case <-c.stopCh:
+		// already closed
+	default:
+		close(c.stopCh)
+	}
+	if c.conn != nil {
+		_ = c.conn.Close() // unblock any pending read/write
+	}
 }
 
 // NewClient Initializes a new client receiving the configuration
 // as a parameter
-func NewClient(config ClientConfig) *Client {
-	client := &Client{
-		config: config,
-	}
-	return client
+func NewClient(cfg ClientConfig) *Client {
+	return &Client{config: cfg, stopCh: make(chan struct{})}
 }
 
 // CreateClientSocket Initializes client socket. In case of
