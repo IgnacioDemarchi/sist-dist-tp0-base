@@ -1,33 +1,86 @@
-### Ejercicio 4 – Finalización graceful con SIGTERM
+### Ejercicio 5 – Quiniela: protocolo, serialización y persistencia
 
-En este ejercicio se modificaron **cliente** y **servidor** para que ambos finalicen de manera *graceful* al recibir la señal `SIGTERM`.  
-Finalizar de forma graceful implica cerrar correctamente todos los *file descriptors* (sockets, conexiones, etc.) antes de que el proceso principal termine.  
+En este ejercicio se modificó la lógica del **cliente** y el **servidor** para modelar el caso de uso de una agencia de quiniela que registra apuestas en una central (Lotería Nacional). Se incorporó un **módulo de comunicación** con protocolo propio, serialización JSON y manejo robusto de sockets.
 
 #### Ejecución
 
-El cliente y servidor se ejecutan normalmente con `docker-compose`. Para probar la finalización graceful:  
-
+1) **Levantar servicios** (5 agencias/clientes como ejemplo):
 ```bash
-docker compose up
-docker compose down -t 5
+make docker-compose-up
 ```
 
-El flag `-t` indica el tiempo de espera (en segundos) para que los contenedores reciban la señal `SIGTERM` y finalicen de forma ordenada antes de forzar un `SIGKILL`.  
+2) **Configurar variables de entorno por cliente** (ejemplo para una agencia):
+```bash
+# Asignar por contenedor/servicio del cliente
+NOMBRE="Santiago Lionel"
+APELLIDO="Lorca"
+DOCUMENTO="30904465"
+NACIMIENTO="1999-03-17"
+NUMERO="7574"
+```
+> Cada cliente (agencia 1..5) debe tener sus propios valores. El cliente toma estos campos de `ENV` y los envía al servidor.
+
+3) **Ver logs**:
+```bash
+make docker-compose-logs
+```
+
+- Cliente (éxito):
+```
+action: apuesta_enviada | result: success | dni: 30904465 | numero: 7574
+```
+- Servidor (persistencia ok):
+```
+action: apuesta_almacenada | result: success | dni: 30904465 | numero: 7574
+```
 
 #### Detalles importantes de la solución
 
-- **Cliente (Go):**
-  - Se añadió un `signal.Notify` que captura `SIGINT` y `SIGTERM`.  
-  - Al recibir la señal, se invoca `client.Close()`, que:
-    - Cierra el canal `stopCh` para indicar la detención del loop.  
-    - Cierra el socket activo para desbloquear cualquier `read/write`.  
-  - Los mensajes de log confirman el cierre del loop y de la conexión.  
+- **Variables de entorno (cliente)**  
+  - `NOMBRE`, `APELLIDO`, `DOCUMENTO`, `NACIMIENTO` (`YYYY-MM-DD`), `NUMERO` (entero).  
+  - El cliente arma la apuesta con la `AgencyID` (ID del cliente) y envía el mensaje.
 
-- **Servidor (Python):**
-  - Se registraron handlers para `SIGTERM` y `SIGINT`.  
-  - En el handler se llama a `server.stop()`, que:
-    - Cierra el socket de escucha.  
-    - Marca la bandera `_stopping` para salir del loop principal.  
-  - El servidor loguea el inicio y éxito del proceso de cierre.  
+- **Protocolo y serialización (módulo de comunicación)**
+  - **Framing** binario con **prefijo de longitud** de 4 bytes **big-endian** (`!I`).
+  - **Carga** serializada en **JSON**:
+    - Solicitud (**BET**):
+      ```json
+      {
+        "type": "BET",
+        "agency_id": "1",
+        "nombre": "Santiago Lionel",
+        "apellido": "Lorca",
+        "documento": "30904465",
+        "nacimiento": "1999-03-17",
+        "numero": 7574
+      }
+      ```
+    - Respuesta (**ACK**):
+      ```json
+      { "type": "ACK", "ok": true }
+      ```
+  - Funciones helper:
+    - **Python**: `send_frame/recv_frame`, `send_json/recv_json` (evitan short read/write usando `sendall` y lecturas exactas).
+    - **Go**: `writeFrame/readFrame` con `io.ReadFull` + `json.Marshal/Unmarshal`.
 
-- Ambos sistemas reportan en logs la finalización de recursos al recibir la señal, garantizando un cierre controlado y evitando fugas de recursos.  
+- **Servidor (Python)**
+  - Acepta conexiones, recibe **BET**, mapea a `Bet(...)` y persiste con `store_bets([...])` (provista por la cátedra).  
+  - Responde **ACK { ok: true/false }**.  
+  - Manejo de errores y límites (p. ej., tamaño máximo de frame), logs de recepción y persistencia.  
+  - Conserva el cierre *graceful* (SIGINT/SIGTERM) del ejercicio anterior.
+
+- **Cliente (Go)**
+  - Lee `ENV`, construye `Bet`, invoca `SendBet`, valida **ACK** y loguea el resultado.  
+  - Loop interrumpible y cierre *graceful* (canal `stopCh` + cierre de socket) ante `SIGTERM`.  
+  - Logs de éxito/fracaso por apuesta.
+
+- **Separación de responsabilidades**
+  - **Dominio**: `Bet` / `store_bets` (servidor).  
+  - **Comunicación**: framing + (de)serialización JSON y envío/recepción.  
+  - **Aplicación**: orquestación, validación, logs y control de ciclo de vida.
+
+- **Manejo robusto de sockets**
+  - Prevención de **short read/write** (`sendall`/`io.ReadFull`/lecturas exactas).  
+  - Validación de tamaños (rechazo de frames inválidos).  
+  - Cierre seguro de conexiones en `finally/defer` y ante señales.
+
