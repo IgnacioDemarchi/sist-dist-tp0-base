@@ -26,7 +26,7 @@ cat >> "$OUT" <<YAML
     entrypoint: /client
     environment:
       - CLI_ID=$i
-      - CLI_LOG_LEVEL=INFO
+      - CLI_LOG_LEVEL=DEBUG
     volumes:
       - ./client/config.yaml:/config.yaml:ro
     networks: [testing_net]
