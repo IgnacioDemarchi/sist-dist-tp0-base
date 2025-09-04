@@ -1,86 +1,113 @@
-### Ejercicio 5 – Quiniela: protocolo, serialización y persistencia
+### Ejercicio 6 – Procesamiento por *batches* (chunks) desde datasets
 
-En este ejercicio se modificó la lógica del **cliente** y el **servidor** para modelar el caso de uso de una agencia de quiniela que registra apuestas en una central (Lotería Nacional). Se incorporó un **módulo de comunicación** con protocolo propio, serialización JSON y manejo robusto de sockets.
+Se extendió el cliente para enviar **varias apuestas por consulta** (modalidad *batch*), y el servidor para **aceptar y persistir lotes completos**. Se mantiene el protocolo con **framing binario (4 bytes big-endian)** y **payload JSON**, respetando el límite de **8 kB** por frame.
 
 #### Ejecución
 
-1) **Levantar servicios** (5 agencias/clientes como ejemplo):
+1) **Preparar datasets** (provistos por la cátedra):
+```bash
+# Colocar y descomprimir dentro del repo
+unzip .data/datasets.zip -d .data/
+# Debe existir: .data/agency-1.csv, .data/agency-2.csv, ... .data/agency-5.csv
+```
+
+2) **Levantar servicios** (el compose ya monta datasets y config):
 ```bash
 make docker-compose-up
 ```
-
-2) **Configurar variables de entorno por cliente** (ejemplo para una agencia):
-```bash
-# Asignar por contenedor/servicio del cliente
-NOMBRE="Santiago Lionel"
-APELLIDO="Lorca"
-DOCUMENTO="30904465"
-NACIMIENTO="1999-03-17"
-NUMERO="7574"
-```
-> Cada cliente (agencia 1..5) debe tener sus propios valores. El cliente toma estos campos de `ENV` y los envía al servidor.
 
 3) **Ver logs**:
 ```bash
 make docker-compose-logs
 ```
-
-- Cliente (éxito):
+- Cliente (lote enviado OK):
 ```
-action: apuesta_enviada | result: success | dni: 30904465 | numero: 7574
+action: apuesta_enviada | result: success | cantidad: <N>
 ```
-- Servidor (persistencia ok):
+- Servidor (lote almacenado OK):
 ```
-action: apuesta_almacenada | result: success | dni: 30904465 | numero: 7574
+action: apuesta_recibida | result: success | cantidad: <N>
+```
+- Si hay **algún error** en el lote, el servidor responde **NACK** y loguea:
+```
+action: apuesta_recibida | result: fail | cantidad: <N>
 ```
 
 #### Detalles importantes de la solución
 
-- **Variables de entorno (cliente)**  
-  - `NOMBRE`, `APELLIDO`, `DOCUMENTO`, `NACIMIENTO` (`YYYY-MM-DD`), `NUMERO` (entero).  
-  - El cliente arma la apuesta con la `AgencyID` (ID del cliente) y envía el mensaje.
+- **Ingesta por agencia via datasets**  
+  Cada cliente `N` carga su archivo `/.data/agency-{N}.csv`, inyectado por **volumen**:
+  ```yaml
+  # en docker-compose
+  volumes:
+    - ./.data:/data:ro
+  ```
+  El cliente lee `/data/agency-{ID}.csv`, parsea filas y arma apuestas.
 
-- **Protocolo y serialización (módulo de comunicación)**
-  - **Framing** binario con **prefijo de longitud** de 4 bytes **big-endian** (`!I`).
-  - **Carga** serializada en **JSON**:
-    - Solicitud (**BET**):
-      ```json
-      {
-        "type": "BET",
-        "agency_id": "1",
-        "nombre": "Santiago Lionel",
-        "apellido": "Lorca",
-        "documento": "30904465",
-        "nacimiento": "1999-03-17",
-        "numero": 7574
-      }
-      ```
-    - Respuesta (**ACK**):
-      ```json
-      { "type": "ACK", "ok": true }
-      ```
-  - Funciones helper:
-    - **Python**: `send_frame/recv_frame`, `send_json/recv_json` (evitan short read/write usando `sendall` y lecturas exactas).
-    - **Go**: `writeFrame/readFrame` con `io.ReadFull` + `json.Marshal/Unmarshal`.
+- **Batch configurable y ≤ 8 kB**  
+  En `client/config.yaml` se respeta la clave:
+  ```yaml
+  batch:
+    maxAmount: 100   # ejemplo; ajustar para que cada frame JSON no supere 8 kB
+  ```
+  Además del tope lógico `batch.maxAmount`, el cliente **fragmenta** dinámicamente (binaria) para garantizar que **cada frame JSON ≤ 8192 bytes**. Si un chunk no entra, lo divide y envía sub-lotes sucesivos.
+
+- **Protocolo y mensajes**
+  - Framing: **4 bytes** de longitud **big-endian** + JSON.
+  - **Solicitud de batch** (cliente → servidor):
+    ```json
+    {
+      "type": "BATCH_BET",
+      "agency_id": "3",
+      "bets": [
+        { "nombre":"...", "apellido":"...", "documento":"...", "nacimiento":"YYYY-MM-DD", "numero": 1234 },
+        ...
+      ]
+    }
+    ```
+  - **Respuesta** (servidor → cliente):
+    ```json
+    { "type": "ACK_BATCH", "ok": true, "count": N }
+    ```
+    o, en error:
+    ```json
+    { "type": "ACK_BATCH", "ok": false, "count": N, "error": "..." }
+    ```
 
 - **Servidor (Python)**
-  - Acepta conexiones, recibe **BET**, mapea a `Bet(...)` y persiste con `store_bets([...])` (provista por la cátedra).  
-  - Responde **ACK { ok: true/false }**.  
-  - Manejo de errores y límites (p. ej., tamaño máximo de frame), logs de recepción y persistencia.  
-  - Conserva el cierre *graceful* (SIGINT/SIGTERM) del ejercicio anterior.
+  - En `__handle_client_connection` detecta `"type": "BATCH_BET"`, construye `Bet(...)` por cada fila y **persiste atómicamente** con `store_bets(bets)`.  
+  - Log de éxito: `action: apuesta_recibida | result: success | cantidad: N`.  
+  - En caso de excepción, responde `ACK_BATCH { ok:false }` y loguea `result: fail`.
 
 - **Cliente (Go)**
-  - Lee `ENV`, construye `Bet`, invoca `SendBet`, valida **ACK** y loguea el resultado.  
-  - Loop interrumpible y cierre *graceful* (canal `stopCh` + cierre de socket) ante `SIGTERM`.  
-  - Logs de éxito/fracaso por apuesta.
+  - Carga CSV de la agencia (`/data/agency-{ID}.csv`).  
+  - Arma *batches* de tamaño ≤ `batch.maxAmount` y además aplica **particionado por tamaño** (≤ 8 kB/frame).  
+  - Envía lote(s) con `SendBatches(...)`; valida `ACK_BATCH`.  
+  - Logs por lote enviado (éxito/fallo) y cierre *graceful* heredado (SIGTERM).
 
-- **Separación de responsabilidades**
-  - **Dominio**: `Bet` / `store_bets` (servidor).  
-  - **Comunicación**: framing + (de)serialización JSON y envío/recepción.  
-  - **Aplicación**: orquestación, validación, logs y control de ciclo de vida.
+- **Short read/write evitados**
+  - **Python**: `sendall`, lecturas exactas (`_recv_exact`).  
+  - **Go**: `io.ReadFull` y `sendall` equivalente, más validaciones de tamaño.
 
-- **Manejo robusto de sockets**
-  - Prevención de **short read/write** (`sendall`/`io.ReadFull`/lecturas exactas).  
-  - Validación de tamaños (rechazo de frames inválidos).  
-  - Cierre seguro de conexiones en `finally/defer` y ante señales.
+#### Notas de composición (ya incorporadas en el script)
+
+- Cada `clientN` monta:
+  ```yaml
+  - ./client/config.yaml:/config.yaml:ro
+  - ./.data:/data:ro
+  ```
+- Variables de ejemplo (además de `CLI_ID`) para compatibilidad con ejercicios previos:
+  ```yaml
+  - NOMBRE=JuanN
+  - APELLIDO=PerezN
+  - DOCUMENTO=<random>
+  - NACIMIENTO=1990-01-01
+  - NUMERO=<random>
+  ```
+  *(El ejercicio 6 prioriza los CSV; estas envs pueden quedar para backwards-compat.)*
+
+#### Pruebas rápidas
+
+- **OK**: datasets válidos, `batch.maxAmount` razonable → ver `success` en cliente y servidor.  
+- **Error en lote**: forzar un registro inválido en el CSV (e.g., `numero` no entero) → el servidor debe responder `ACK_BATCH { ok:false }` y loguear `result: fail`.
 
