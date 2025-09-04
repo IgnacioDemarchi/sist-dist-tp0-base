@@ -39,20 +39,20 @@ environment:
 
 #### Protocolo y handlers (resumen)
 
-- Se mantienen los tipos de mensaje de ejercicios previos: `BET`, `BATCH_BET`, `DONE`, `GET_WINNERS`.  
-- **Persistencia**:
-  - `BET`: `store_bets([bet])` bajo lock → `ACK { ok:true }`.
-  - `BATCH_BET`: `store_bets(bets)` bajo lock; log `apuesta_recibida` (success/fail) → `ACK_BATCH`.
-- **Coordinación de sorteo**:
-  - `DONE` agrega la agencia a `_done_agencies`.  
+- Se mantienen los tipos de mensaje de ejercicios previos: `BET`, `BATCH`, `DONE`, `GET_WINNERS`.  
+- **Persistencia (concurrencia segura)**:
+  - `BET`: `store_bets([bet])` protegido con **lock** → `ACK|OK`.
+  - `BATCH`: `store_bets(bets)` protegido con **lock**; log `apuesta_recibida` (success/fail) → `ACK_BATCH|OK|N` o `ACK_BATCH|ERR|...`.
+- **Coordinación de sorteo (multithreading)**:
+  - `DONE` agrega la agencia a `_done_agencies` bajo lock.  
   - Si `CLIENT_AMOUNT` no está fijado, se **infieren** agencias 1..N a partir de los `DONE`.  
   - `_perform_draw_if_ready()` (bajo lock) ejecuta el sorteo cuando se alcanzó N:
     - `load_bets()` + `has_won()` → `_winners_by_agency`.  
     - Log: `action: sorteo | result: success`.
 - **Consulta de ganadores**:
   - `GET_WINNERS`:
-    - Si el sorteo no terminó → `WINNERS { ok:false, error:"not_ready" }`.
-    - Si terminó → `WINNERS { ok:true, dnis:[...] }` **solo de la agencia solicitante**.
+    - Si el sorteo no terminó → `WINNERS|ERR|not_ready`.
+    - Si terminó → `WINNERS|OK|dni1,dni2,...` **solo de la agencia solicitante**.
 
 #### Por qué `RLock` y no `Lock`
 
