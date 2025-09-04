@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -85,7 +86,14 @@ func readLine(conn net.Conn) (string, []string, error) {
 
 // ------- single bet -------
 func SendBet(conn net.Conn, b Bet) error {
-	if err := sendLine(conn, "BET", encodeBetLine(b)); err != nil {
+	if err := sendLine(conn, "BET",
+		b.AgencyID,
+		b.Nombre,
+		b.Apellido,
+		b.Documento,
+		b.Nacimiento,
+		strconv.Itoa(b.Numero),
+	); err != nil {
 		return err
 	}
 	typ, parts, err := readLine(conn)
@@ -105,22 +113,29 @@ func SendBet(conn net.Conn, b Bet) error {
 	return fmt.Errorf("server NACK: %s", reason)
 }
 
-// ------- batch (auto split by size if needed) -------
+// ------- batch (one frame per line) -------
 const maxPayload = 8 * 1024
 
-// Sends one batch header + lines (no auto-splitting)
-func sendRawBatch(conn net.Conn, agencyID string, bets []Bet) error {
-	header := fmt.Sprintf("BATCH|%s|%d\n", agencyID, len(bets))
-	body := header
-	for _, b := range bets {
-		body += encodeBetLine(b) + "\n"
-	}
-	if len(body) > maxPayload {
-		return fmt.Errorf("batch too large: %d", len(body))
-	}
-	if err := writeFrame(conn, []byte(body)); err != nil {
+// Send one batch header + N BET frames; expect ACK_BATCH|OK|N
+func sendBatch(conn net.Conn, agencyID string, bets []Bet) error {
+	// header
+	if err := sendLine(conn, "BATCH", agencyID, strconv.Itoa(len(bets))); err != nil {
 		return err
 	}
+	// N bet lines
+	for _, b := range bets {
+		if err := sendLine(conn, "BET",
+			b.AgencyID,
+			b.Nombre,
+			b.Apellido,
+			b.Documento,
+			b.Nacimiento,
+			strconv.Itoa(b.Numero),
+		); err != nil {
+			return err
+		}
+	}
+	// ack
 	typ, parts, err := readLine(conn)
 	if err != nil {
 		return err
@@ -138,21 +153,22 @@ func sendRawBatch(conn net.Conn, agencyID string, bets []Bet) error {
 	return fmt.Errorf("server NACK batch: %s", reason)
 }
 
-// Split bets into multiple frames (<=8KB each) and send sequentially.
+// Split bets into multiple batches (<= 8KB each if your server enforces it)
+// and send sequentially using sendBatch.
 func SendBatches(conn net.Conn, agencyID string, bets []Bet) error {
 	i := 0
 	for i < len(bets) {
-		// binary search largest sub-slice starting at i that fits
+		// Find the largest sub-slice that fits into 8KB (header + lines)
 		lo, hi := i+1, len(bets)+1
 		best := -1
 		for lo < hi {
 			mid := (lo + hi) / 2
 			header := fmt.Sprintf("BATCH|%s|%d\n", agencyID, mid-i)
-			body := header
+			size := len(header)
 			for _, b := range bets[i:mid] {
-				body += encodeBetLine(b) + "\n"
+				size += len(encodeBetLine(b)) + 1 // + '\n'
 			}
-			if len(body) <= maxPayload {
+			if size <= maxPayload {
 				best = mid
 				lo = mid + 1
 			} else {
@@ -162,7 +178,7 @@ func SendBatches(conn net.Conn, agencyID string, bets []Bet) error {
 		if best == -1 {
 			return fmt.Errorf("cannot fit bet at index %d", i)
 		}
-		if err := sendRawBatch(conn, agencyID, bets[i:best]); err != nil {
+		if err := sendBatch(conn, agencyID, bets[i:best]); err != nil {
 			return err
 		}
 		i = best
