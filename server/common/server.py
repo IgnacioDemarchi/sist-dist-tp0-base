@@ -1,7 +1,7 @@
 import socket
 import logging
 import os
-from common.comm import recv_json, send_json 
+from common.comm import recv_line, send_line
 from common.utils import Bet, store_bets, load_bets, has_won
 class Server:
     def __init__(self, port, listen_backlog):
@@ -44,125 +44,102 @@ class Server:
             self.__handle_client_connection(client_sock)
 
     def __handle_client_connection(self, client_sock):
-        """
-        Receive length-prefixed JSON frames.
-        Accept BET messages, persist them, ACK, and keep going
-        until client closes connection.
-        """
         try:
             while True:
                 try:
-                    msg = recv_json(client_sock)
+                    line = recv_line(client_sock)
                 except EOFError:
-                    break  # client closed
-                except Exception as e:
-                    logging.error(f"action: recv | result: fail | error: {e}")
                     break
+                parts = line.split("|")
+                typ, rest = parts[0], parts[1:]
 
-                mtype = msg.get("type")
-
-                # ----- DONE -----
-                if mtype == "DONE":
-                    agency = str(msg.get("agency_id", "0"))
+                if typ == "DONE":
+                    agency = rest[0] if rest else "0"
                     self._done_agencies.add(agency)
-
-                    # Infer N from DONEs only if env wasn’t given
-                    if self._expected_agencies_env is None:
-                        try:
-                            ids = [int(a) for a in self._done_agencies if a.isdigit()]
-                            if ids:
-                                self._expected_agencies = max(ids)  # agencies are 1..N
-                        except Exception:
-                            pass
-
-                    logging.debug(
-                        f"action: done_received | result: success | agency: {agency} | "
-                        f"done_count: {len(self._done_agencies)} | expected: {self._expected_agencies}"
-                    )
-
                     self._perform_draw_if_ready()
-                    try:
-                        send_json(client_sock, {"type": "ACK_DONE", "ok": True})
-                    except Exception:
-                        pass
+                    send_line(client_sock, "ACK_DONE|OK")
                     continue
-                    # ----- GET_WINNERS -----
-                if mtype == "GET_WINNERS":
-                    agency = str(msg.get("agency_id", "0"))
+
+                if typ == "GET_WINNERS":
+                    agency = rest[0] if rest else "0"
                     if not self._draw_completed:
-                        send_json(client_sock, {"type": "WINNERS", "ok": False, "error": "not_ready"})
+                        send_line(client_sock, "WINNERS|ERR|not_ready")
                         continue
                     dnis = self._winners_by_agency.get(agency, [])
-                    send_json(client_sock, {"type": "WINNERS", "ok": True, "dnis": dnis})
+                    payload = "WINNERS|OK|" + ",".join(map(str, dnis))
+                    send_line(client_sock, payload)
                     continue
 
-
-                if mtype == "BATCH_BET":
-                    agency = msg.get("agency_id", "0")
-                    rows = msg.get("bets", [])
-                    count = len(rows)
+                if typ == "BATCH":
+                    # rest: [agency, count]
+                    if len(rest) < 2:
+                        send_line(client_sock, "ACK_BATCH|ERR|0|bad_header")
+                        continue
+                    agency = rest[0]
                     try:
-                        bets = []
-                        for b in rows:
-                            bet = Bet(
-                                agency=agency,
-                                first_name=b.get("nombre", ""),
-                                last_name=b.get("apellido", ""),
-                                document=b.get("documento", ""),
-                                birthdate=b.get("nacimiento", ""),
-                                number=str(b.get("numero", 0)),
-                            )
-                            bets.append(bet)
+                        count = int(rest[1])
+                    except Exception:
+                        send_line(client_sock, "ACK_BATCH|ERR|0|bad_count")
+                        continue
 
-                        # persist atomically
-                        store_bets(bets)
+                    bets = []
+                    ok = True
+                    err = ""
+                    for _ in range(count):
+                        try:
+                            betline = recv_line(client_sock)
+                        except EOFError:
+                            ok = False
+                            err = "missing_rows"
+                            break
+                        f = betline.split("|")
+                        if len(f) < 5:
+                            ok = False
+                            err = "bad_row"
+                            break
+                        nombre, apellido, documento, nacimiento, numero = f[:5]
+                        try:
+                            b = Bet(agency, nombre, apellido, documento, nacimiento, numero)
+                            bets.append(b)
+                        except Exception as e:
+                            ok = False
+                            err = str(e)
+                            break
 
-                        logging.info(f"action: apuesta_recibida | result: success | cantidad: {count}")
+                    if ok:
+                        try:
+                            store_bets(bets)
+                            logging.info(f"action: apuesta_recibida | result: success | cantidad: {len(bets)}")
+                            send_line(client_sock, f"ACK_BATCH|OK|{len(bets)}")
+                        except Exception as e:
+                            logging.error(f"action: apuesta_recibida | result: fail | cantidad: {len(bets)} | error: {e}")
+                            send_line(client_sock, f"ACK_BATCH|ERR|{len(bets)}|persist_fail")
+                    else:
+                        logging.error(f"action: apuesta_recibida | result: fail | cantidad: {count} | error: {err}")
+                        send_line(client_sock, f"ACK_BATCH|ERR|{count}|{err}")
+                    continue
 
-                        send_json(client_sock, {"type": "ACK_BATCH", "ok": True, "count": count})
-
+                if typ == "BET":
+                    if len(rest) < 1:
+                        send_line(client_sock, "ACK|ERR|bad_row")
+                        continue
+                    f = rest[0].split("|")
+                    if len(f) < 6:
+                        send_line(client_sock, "ACK|ERR|bad_row")
+                        continue
+                    agency, nombre, apellido, documento, nacimiento, numero = f[:6]
+                    try:
+                        b = Bet(agency, nombre, apellido, documento, nacimiento, numero)
+                        store_bets([b])
+                        logging.info(f"action: apuesta_almacenada | result: success | dni: {b.document} | numero: {b.number}")
+                        send_line(client_sock, "ACK|OK")
                     except Exception as e:
-                        logging.error(f"action: apuesta_recibida | result: fail | cantidad: {count} | error: {e}")
-                        send_json(client_sock, {"type": "ACK_BATCH", "ok": False, "count": count, "error": str(e)})
+                        logging.error(f"action: apuesta_almacenada | result: fail | dni: {documento} | numero: {numero} | error: {e}")
+                        send_line(client_sock, "ACK|ERR|persist_fail")
                     continue
 
-
-                if mtype != "BET":
-                    # Unknown or missing type → negative ACK
-                    try:
-                        send_json(client_sock, {"type": "ACK", "ok": False, "error": "unknown message type"})
-                    except Exception:
-                        pass
-                    continue
-
-                # Map fields from client payload to Bet(...)
-                try:
-                    bet = Bet(
-                        agency=msg.get("agency_id", "0"),
-                        first_name=msg.get("nombre", ""),
-                        last_name=msg.get("apellido", ""),
-                        document=msg.get("documento", ""),
-                        birthdate=msg.get("nacimiento", "1970-01-01"),
-                        number=str(msg.get("numero", 0)),
-                    )
-                    store_bets([bet])
-
-                    logging.info(
-                        f"action: apuesta_almacenada | result: success | dni: {bet.document} | numero: {bet.number}"
-                    )
-
-                    send_json(client_sock, {"type": "ACK", "ok": True})
-
-                except Exception as e:
-                    logging.error(
-                        f"action: apuesta_almacenada | result: fail | dni: {msg.get('documento','')} "
-                        f"| numero: {msg.get('numero',0)} | error: {e}"
-                    )
-                    try:
-                        send_json(client_sock, {"type": "ACK", "ok": False, "error": str(e)})
-                    except Exception:
-                        pass
-
+                # unknown
+                send_line(client_sock, "ACK|ERR|unknown")
         except OSError as e:
             logging.error(f"action: client_handler | result: fail | error: {e}")
         finally:
@@ -170,7 +147,7 @@ class Server:
                 client_sock.close()
             except OSError:
                 pass
-
+            
     def __accept_new_connection(self):
         """
         Accept new connections

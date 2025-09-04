@@ -141,12 +141,9 @@ func (c *Client) StartClientLoop() {
 		if err := c.createClientSocket(); err != nil {
 			return
 		}
-		ack, err := SendBatches(c.conn, c.config.ID, chunk)
+		err := SendBatches(c.conn, c.config.ID, chunk)
 		_ = c.conn.Close()
-		if err != nil || ack == nil || !ack.OK {
-			if err == nil {
-				err = fmt.Errorf("server nack or nil ack")
-			}
+		if err != nil {
 			log.Errorf("action: apuesta_enviada | result: fail | cantidad: %d | error: %v", len(chunk), err)
 			return
 		}
@@ -191,10 +188,10 @@ func (c *Client) StartClientLoop() {
 		if err := c.createClientSocket(); err != nil {
 			return
 		}
-		wr, err := RequestWinners(c.conn, c.config.ID)
+		wr, err := GetWinners(c.conn, c.config.ID)
 		_ = c.conn.Close()
-		if err == nil && wr.OK {
-			log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d", len(wr.DNIs))
+		if err == nil {
+			log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d", len(wr))
 			break
 		}
 		// backoff a bit before retrying
