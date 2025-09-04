@@ -12,6 +12,7 @@ services:
     entrypoint: python3 /main.py
     environment:
       - PYTHONUNBUFFERED=1
+      - CLIENT_AMOUNT=$N
     volumes:
       - ./server/config.ini:/config.ini:ro
     networks: [testing_net]
