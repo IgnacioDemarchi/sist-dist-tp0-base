@@ -26,8 +26,10 @@ def send_frame(sock: socket.socket, payload: bytes) -> None:
     sock.sendall(struct.pack("!I", len(payload)))
     sock.sendall(payload)
 
-def recv_json(sock: socket.socket) -> dict:
-    return json.loads(recv_frame(sock).decode("utf-8"))
+def recv_line(sock) -> str:
+    return recv_frame(sock).decode("utf-8").rstrip("\r\n")
 
-def send_json(sock: socket.socket, obj: dict) -> None:
-    send_frame(sock, json.dumps(obj).encode("utf-8"))
+def send_line(sock, line: str) -> None:
+    if not line.endswith("\n"):
+        line += "\n"
+    send_frame(sock, line.encode("utf-8"))

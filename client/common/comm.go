@@ -2,19 +2,19 @@ package common
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 )
 
+// ------- framing --------
 func writeFrame(conn net.Conn, payload []byte) error {
-	if len(payload) > 8*1024 { // cop-out limit; increase if you like
+	if len(payload) > 8*1024 {
 		return fmt.Errorf("payload too big: %d", len(payload))
 	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-	// sendall: header first, then body
 	if _, err := conn.Write(hdr[:]); err != nil {
 		return err
 	}
@@ -45,196 +45,142 @@ func readFrame(conn net.Conn) ([]byte, error) {
 	return buf, nil
 }
 
-// --- JSON message types ---
+// ------- domain types  -------
 type Bet struct {
-	Type       string `json:"type"` // "BET"
-	AgencyID   string `json:"agency_id"`
-	Nombre     string `json:"nombre"`
-	Apellido   string `json:"apellido"`
-	Documento  string `json:"documento"`
-	Nacimiento string `json:"nacimiento"` // "YYYY-MM-DD"
-	Numero     int    `json:"numero"`
+	AgencyID   string
+	Nombre     string
+	Apellido   string
+	Documento  string
+	Nacimiento string // YYYY-MM-DD
+	Numero     int
 }
 
-type Ack struct {
-	Type  string `json:"type"` // "ACK"
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+// ------- line encoding / parsing -------
+func encodeBetLine(b Bet) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%d",
+		b.AgencyID, b.Nombre, b.Apellido, b.Documento, b.Nacimiento, b.Numero)
 }
 
-func SendBet(conn net.Conn, b *Bet) (*Ack, error) {
-	b.Type = "BET"
-	js, err := json.Marshal(b)
+func sendLine(conn net.Conn, typ string, parts ...string) error {
+	line := typ
+	for _, p := range parts {
+		line += "|" + p
+	}
+	line += "\n"
+	return writeFrame(conn, []byte(line))
+}
+
+func readLine(conn net.Conn) (string, []string, error) {
+	pkt, err := readFrame(conn)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if err := writeFrame(conn, js); err != nil {
-		return nil, err
+	line := strings.TrimRight(string(pkt), "\r\n")
+	fields := strings.Split(line, "|")
+	if len(fields) == 0 {
+		return "", nil, fmt.Errorf("empty line")
 	}
-	resp, err := readFrame(conn)
+	return fields[0], fields[1:], nil
+}
+
+// ------- single bet -------
+func SendBet(conn net.Conn, b Bet) error {
+	if err := sendLine(conn, "BET", encodeBetLine(b)); err != nil {
+		return err
+	}
+	typ, parts, err := readLine(conn)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var ack Ack
-	if err := json.Unmarshal(resp, &ack); err != nil {
-		return nil, err
+	if typ != "ACK" {
+		return fmt.Errorf("unexpected reply: %s", typ)
 	}
-	if ack.Type != "ACK" {
-		return nil, fmt.Errorf("unexpected reply type: %s", ack.Type)
+	if len(parts) >= 1 && parts[0] == "OK" {
+		return nil
 	}
-	return &ack, nil
-}
-
-// ---------- Batching ----------
-
-type Batch struct {
-	Type     string `json:"type"` // "BATCH_BET"
-	AgencyID string `json:"agency_id"`
-	Bets     []Bet  `json:"bets"`
-}
-
-type BatchAck struct {
-	Type  string `json:"type"` // "ACK_BATCH"
-	OK    bool   `json:"ok"`
-	Count int    `json:"count"`
-	Error string `json:"error,omitempty"`
-}
-
-const maxPayload = 8 * 1024 // must match server cap
-
-func SendBatchBet(conn net.Conn, agencyID string, bets []Bet) (*BatchAck, [][]Bet, error) {
-	// Try to send all; if too big, split until it fits.
-	l, r := 0, len(bets)
-	var lastGood int
-	for l < r {
-		payload := Batch{Type: "BATCH_BET", AgencyID: agencyID, Bets: bets[l:r]}
-		js, err := json.Marshal(payload)
-		if err != nil {
-			return nil, nil, err
-		}
-		if len(js) <= maxPayload {
-			// fits → send it
-			if err := writeFrame(conn, js); err != nil {
-				return nil, nil, err
-			}
-			resp, err := readFrame(conn)
-			if err != nil {
-				return nil, nil, err
-			}
-			var ack BatchAck
-			if err := json.Unmarshal(resp, &ack); err != nil {
-				return nil, nil, err
-			}
-			if ack.Type != "ACK_BATCH" {
-				return nil, nil, fmt.Errorf("unexpected reply type: %s", ack.Type)
-			}
-			// remaining batches (if any) are none because we tried to send all at once
-			return &ack, nil, nil
-		}
-		// Too big: reduce window by halving
-		lastGood = (l + r) / 2
-		if lastGood <= l {
-			// Single item too large: fail fast (shouldn't happen with small bets)
-			return nil, nil, fmt.Errorf("single bet too large to fit frame")
-		}
-		r = lastGood
+	reason := ""
+	if len(parts) >= 2 {
+		reason = parts[1]
 	}
-	return nil, nil, fmt.Errorf("unexpected batching logic failure")
+	return fmt.Errorf("server NACK: %s", reason)
 }
 
-// Helper: split bets into many <=8KB batches and send them one by one.
-func SendBatches(conn net.Conn, agencyID string, bets []Bet) (*BatchAck, error) {
-	i := 0
-	for i < len(bets) {
-		// Find the largest sub-slice starting at i that fits
-		lo, hi := i+1, len(bets)+1
-		best := -1
-		for lo < hi {
-			mid := (lo + hi) / 2
-			payload := Batch{Type: "BATCH_BET", AgencyID: agencyID, Bets: bets[i:mid]}
-			js, _ := json.Marshal(payload)
-			if len(js) <= maxPayload {
-				best = mid
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
-		if best == -1 {
-			return nil, fmt.Errorf("cannot fit any bet into frame at index %d", i)
-		}
-		// send this chunk
-		chunk := bets[i:best]
-		if _, _, err := SendBatchBet(conn, agencyID, chunk); err != nil {
-			return nil, err
-		}
-		i = best
+// ------- batch (auto split by size if needed) -------
+const maxPayload = 8 * 1024
+
+// Sends one batch: header frame + N field-only frames, then waits for ACK_BATCH
+func sendBatch(conn net.Conn, agencyID string, bets []Bet) error {
+	// Header (one frame)
+	header := fmt.Sprintf("BATCH|%s|%d\n", agencyID, len(bets))
+	if err := writeFrame(conn, []byte(header)); err != nil {
+		return err
 	}
-	// Return a synthetic success ack with total count
-	return &BatchAck{Type: "ACK_BATCH", OK: true, Count: len(bets)}, nil
+
+	// N bet lines, each as its own frame:
+	// nombre|apellido|documento|nacimiento|numero
+	for _, b := range bets {
+		line := fmt.Sprintf("%s|%s|%s|%s|%d\n", b.Nombre, b.Apellido, b.Documento, b.Nacimiento, b.Numero)
+		if err := writeFrame(conn, []byte(line)); err != nil {
+			return err
+		}
+	}
+
+	// ACK
+	typ, parts, err := readLine(conn)
+	if err != nil {
+		return err
+	}
+	if typ != "ACK_BATCH" {
+		return fmt.Errorf("unexpected reply: %s", typ)
+	}
+	if len(parts) >= 1 && parts[0] == "OK" {
+		return nil
+	}
+	reason := ""
+	if len(parts) >= 3 {
+		reason = parts[2]
+	}
+	return fmt.Errorf("server NACK batch: %s", reason)
 }
 
-type Done struct {
-	Type     string `json:"type"` // "DONE"
-	AgencyID string `json:"agency_id"`
-}
-type AckDone struct {
-	Type string `json:"type"` // "ACK_DONE"
-	OK   bool   `json:"ok"`
-}
-type GetWinners struct {
-	Type     string `json:"type"` // "GET_WINNERS"
-	AgencyID string `json:"agency_id"`
-}
-type WinnersResp struct {
-	Type  string   `json:"type"` // "WINNERS"
-	OK    bool     `json:"ok"`
-	DNIs  []string `json:"dnis,omitempty"`
-	Error string   `json:"error,omitempty"`
-}
-
+// ------- coordination (done / winners) -------
 func SendDone(conn net.Conn, agencyID string) error {
-	req := Done{Type: "DONE", AgencyID: agencyID}
-	js, err := json.Marshal(req)
+	if err := sendLine(conn, "DONE", agencyID); err != nil {
+		return err
+	}
+	typ, parts, err := readLine(conn)
 	if err != nil {
 		return err
 	}
-	if err := writeFrame(conn, js); err != nil {
-		return err
+	if typ != "ACK_DONE" {
+		return fmt.Errorf("unexpected reply: %s", typ)
 	}
-	resp, err := readFrame(conn)
-	if err != nil {
-		return err
+	if len(parts) >= 1 && parts[0] == "OK" {
+		return nil
 	}
-	var ack AckDone
-	if err := json.Unmarshal(resp, &ack); err != nil {
-		return err
-	}
-	if ack.Type != "ACK_DONE" || !ack.OK {
-		return fmt.Errorf("ack_done not ok")
-	}
-	return nil
+	return fmt.Errorf("server NACK DONE")
 }
 
-func RequestWinners(conn net.Conn, agencyID string) (*WinnersResp, error) {
-	req := GetWinners{Type: "GET_WINNERS", AgencyID: agencyID}
-	js, err := json.Marshal(req)
+func GetWinners(conn net.Conn, agencyID string) ([]string, error) {
+	if err := sendLine(conn, "GET_WINNERS", agencyID); err != nil {
+		return nil, err
+	}
+	typ, parts, err := readLine(conn)
 	if err != nil {
 		return nil, err
 	}
-	if err := writeFrame(conn, js); err != nil {
-		return nil, err
+	if typ != "WINNERS" {
+		return nil, fmt.Errorf("unexpected reply: %s", typ)
 	}
-	resp, err := readFrame(conn)
-	if err != nil {
-		return nil, err
+	if len(parts) >= 1 && parts[0] == "OK" {
+		if len(parts) >= 2 && parts[1] != "" {
+			return strings.Split(parts[1], ","), nil
+		}
+		return []string{}, nil
 	}
-	var wr WinnersResp
-	if err := json.Unmarshal(resp, &wr); err != nil {
-		return nil, err
+	// ERR
+	if len(parts) >= 2 {
+		return nil, fmt.Errorf(parts[1])
 	}
-	if wr.Type != "WINNERS" {
-		return nil, fmt.Errorf("unexpected reply type: %s", wr.Type)
-	}
-	return &wr, nil
+	return nil, fmt.Errorf("winners error")
 }
