@@ -1,86 +1,67 @@
-### Ejercicio 7 – Notificación de fin y consulta de ganadores por agencia
+### Ejercicio 8 – Concurrencia en el servidor (multi-thread)
 
-Se extendieron **cliente** y **servidor** para coordinar el **sorteo**:  
-cada cliente notifica que terminó de enviar sus apuestas y, luego del sorteo global, consulta los **ganadores de su propia agencia**.
+Se modificó el **servidor (Python)** para **aceptar múltiples conexiones y procesar mensajes en paralelo** mediante *threads*, cuidando la **sincronización** alrededor de la persistencia y del estado global del sorteo.
 
 #### Ejecución
 
-1) **Levantar servicios** (se asume 5 agencias/clients):
 ```bash
 make docker-compose-up
+make docker-compose-logs
 ```
 
-2) **(Opcional) Configurar cantidad esperada de agencias** en el servidor:  
-el servidor puede inferirla dinámicamente a partir de los `DONE` recibidos (IDs 1..N).  
-Si se prefiere fijarla explícitamente:
-```bash
+> Opcional: fijar la cantidad esperada de agencias para el sorteo
+```yaml
 # en el servicio del servidor
 environment:
   - CLIENT_AMOUNT=5
 ```
 
-3) **Ver logs**:
-```bash
-make docker-compose-logs
-```
-- Cuando todas las agencias notifican fin:
-```
-action: sorteo | result: success
-```
-- Cliente (tras obtener su lista):
-```
-action: consulta_ganadores | result: success | cant_ganadores: <CANT>
-```
+#### Qué cambia
 
-#### Detalles importantes de la solución
+- **Aceptación concurrente**: por cada `accept()` se lanza un **worker thread** que corre `__handle_client_connection`.
+- **Límite de workers**: se mantiene un set de threads vivos y un tope (`_max_workers = 64`) para evitar sobrecarga.
+- **Sincronización**:
+  - Se usa un **`threading.RLock()`** (`_lock`) para proteger acceso a:
+    - Estados globales: `_done_agencies`, `_expected_agencies`, `_draw_completed`, `_winners_by_agency`, `_workers`.
+    - **Persistencia**: llamadas a `store_bets([...])` (y `load_bets()` durante el sorteo) se hacen **bajo lock** para garantizar atomicidad/consistencia.
+  - Handlers de mensajes que mutan estado (p. ej., `DONE`, `GET_WINNERS`, `BATCH_BET`, `BET`) coordinan con el lock.
+- **Aceptación no bloqueante**: el socket de escucha tiene `settimeout(0.5)`; esto permite:
+  - *Reap* periódico de threads terminados (`_reap_workers()`).
+  - Salir ordenadamente cuando `_stopping` es `True`.
+- **Cierre graceful**: en `stop()` se cierra el socket de escucha (desbloquea `accept()`) y se hace **best-effort `join()`** de los workers.
 
-- **Protocolo (mensajes nuevos)**  
-  Se mantiene el framing binario de 4 bytes **big-endian** + **JSON**.
-  - Cliente → Servidor (**DONE**): avisa que finalizó el envío de apuestas.
-    ```json
-    { "type": "DONE", "agency_id": "3" }
-    ```
-    Respuesta:
-    ```json
-    { "type": "ACK_DONE", "ok": true }
-    ```
-  - Cliente → Servidor (**GET_WINNERS**): solicita ganadores para su agencia.  
-    Antes del sorteo, el servidor responde no disponible.
-    ```json
-    { "type": "GET_WINNERS", "agency_id": "3" }
-    ```
-    Respuesta antes del sorteo:
-    ```json
-    { "type": "WINNERS", "ok": false, "error": "not_ready" }
-    ```
-    Respuesta post-sorteo:
-    ```json
-    { "type": "WINNERS", "ok": true, "dnis": ["30904465","..."] }
-    ```
+#### Consideraciones sobre Python (GIL)
 
-- **Comportamiento del servidor**
-  - Guarda apuestas (BET / BATCH_BET) como en ej6.
-  - Registra `DONE` por `agency_id`.  
-  - Cuando recibió `DONE` de **todas** las agencias (N = `CLIENT_AMOUNT` o inferido 1..N), ejecuta el sorteo:
-    - Carga apuestas con `load_bets(...)`.
-    - Evalúa ganadores con `has_won(...)`.
-    - Agrupa por **agencia** y guarda en memoria (`_winners_by_agency`).
+- El **GIL** limita la ejecución verdadera en paralelo de **CPU-bound**; sin embargo, este servidor es **I/O-bound** (sockets), por lo que los *threads* permiten **superponer I/O** y **atender múltiples clientes** concurrentemente.
+- Aun así, las secciones críticas (persistencia y estado del sorteo) requieren **lock** para:
+  - Evitar *race conditions* en `store_bets`/`load_bets`/`has_won`.
+  - Entregar respuestas consistentes (p. ej., `WINNERS` solo *post-sorteo*).
+
+#### Protocolo y handlers (resumen)
+
+- Se mantienen los tipos de mensaje de ejercicios previos: `BET`, `BATCH_BET`, `DONE`, `GET_WINNERS`.  
+- **Persistencia**:
+  - `BET`: `store_bets([bet])` bajo lock → `ACK { ok:true }`.
+  - `BATCH_BET`: `store_bets(bets)` bajo lock; log `apuesta_recibida` (success/fail) → `ACK_BATCH`.
+- **Coordinación de sorteo**:
+  - `DONE` agrega la agencia a `_done_agencies`.  
+  - Si `CLIENT_AMOUNT` no está fijado, se **infieren** agencias 1..N a partir de los `DONE`.  
+  - `_perform_draw_if_ready()` (bajo lock) ejecuta el sorteo cuando se alcanzó N:
+    - `load_bets()` + `has_won()` → `_winners_by_agency`.  
     - Log: `action: sorteo | result: success`.
-  - Solo después del sorteo responde **WINNERS { ok:true }** con los **DNI** de la agencia solicitante (sin broadcast ni filtraciones).
+- **Consulta de ganadores**:
+  - `GET_WINNERS`:
+    - Si el sorteo no terminó → `WINNERS { ok:false, error:"not_ready" }`.
+    - Si terminó → `WINNERS { ok:true, dnis:[...] }` **solo de la agencia solicitante**.
 
-- **Comportamiento del cliente**
-  - Tras enviar todas sus apuestas (en *batches* como ej6), envía **DONE**.
-  - Luego **polling** ligero (backoff corto) con **GET_WINNERS** hasta obtener `ok:true`.
-  - Log final por agencia:  
-    `action: consulta_ganadores | result: success | cant_ganadores: <CANT>`.
-  - Conserva cierre *graceful* (SIGTERM) y reconexiones por operación.
+#### Por qué `RLock` y no `Lock`
 
-- **Aislamiento por agencia**
-  - El servidor devuelve **solo** los **DNI de ganadores** de la **agencia solicitante**.  
-  - No hay broadcast masivo ni exposición de ganadores de otras agencias.
+- Algunos métodos internos (como `_perform_draw_if_ready`) se invocan desde secciones ya protegidas; `RLock` evita *self-deadlock* si se vuelve a adquirir el lock en el mismo hilo.
 
-- **Manejo robusto de red**
-  - Se evita **short read/write** con `sendall`/lecturas exactas en Python y `io.ReadFull`/envíos completos en Go.
-  - Validación de tipos y control de errores en cada handler.
-  - Reintentos del cliente ante `not_ready` hasta que el sorteo se complete.
+#### Pruebas recomendadas
+
+- **Carga concurrente**: levantar 5 clientes enviando *batches* en paralelo; verificar throughput y que no haya `race conditions` (logs consistentes y sin errores de persistencia).
+- **Sorteo**: enviar `DONE` desde cada agencia; confirmar `action: sorteo | result: success` una sola vez.
+- **`GET_WINNERS` antes del sorteo**: debe responder `not_ready`.
+- **Tope de workers**: reducir `_max_workers` a un valor pequeño y abrir muchas conexiones breves; verificar que el servidor cierre nuevas conexiones cuando se alcanza el límite (degradación controlada).
 
