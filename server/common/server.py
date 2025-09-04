@@ -15,12 +15,18 @@ class Server:
         self._done_agencies = set()
         self._draw_completed = False
         self._winners_by_agency = {}
-        try:
-            self._expected_agencies = int(os.getenv("CLIENT_AMOUNT", "5"))
-        except Exception:
-            self._expected_agencies = 5
-        logging.debug(f"action: draw_config | result: success | expected_agencies: {self._expected_agencies}")
-        
+        self._expected_agencies_env = None
+        val = os.getenv("CLIENT_AMOUNT")
+        if val and val.strip():
+            try:
+                self._expected_agencies_env = int(val)
+            except Exception:
+                pass
+
+        self._expected_agencies = self._expected_agencies_env  # may be None
+        logging.debug(
+            f"action: draw_config | result: success | expected_agencies: {self._expected_agencies or 'dynamic'}"
+        )        
 
     def run(self):
         """
@@ -59,14 +65,28 @@ class Server:
                 if mtype == "DONE":
                     agency = str(msg.get("agency_id", "0"))
                     self._done_agencies.add(agency)
+
+                    # Infer N from DONEs only if env wasn’t given
+                    if self._expected_agencies_env is None:
+                        try:
+                            ids = [int(a) for a in self._done_agencies if a.isdigit()]
+                            if ids:
+                                self._expected_agencies = max(ids)  # agencies are 1..N
+                        except Exception:
+                            pass
+
+                    logging.debug(
+                        f"action: done_received | result: success | agency: {agency} | "
+                        f"done_count: {len(self._done_agencies)} | expected: {self._expected_agencies}"
+                    )
+
                     self._perform_draw_if_ready()
                     try:
                         send_json(client_sock, {"type": "ACK_DONE", "ok": True})
                     except Exception:
                         pass
                     continue
-
-                # ----- GET_WINNERS -----
+                    # ----- GET_WINNERS -----
                 if mtype == "GET_WINNERS":
                     agency = str(msg.get("agency_id", "0"))
                     if not self._draw_completed:
