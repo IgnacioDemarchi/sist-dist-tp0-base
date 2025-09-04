@@ -3,7 +3,7 @@ set -euo pipefail
 OUT="${1:-docker-compose-dev.yaml}"
 N="${2:-5}"
 
-cat > "$OUT" <<'YAML'
+cat > "$OUT" <<YAML
 name: tp0
 services:
   server:
