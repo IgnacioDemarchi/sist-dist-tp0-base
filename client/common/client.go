@@ -3,6 +3,7 @@ package common
 import (
 	"encoding/csv"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -29,52 +30,6 @@ type Client struct {
 	stopCh chan struct{}
 }
 
-func loadAgencyBets(agencyID string) ([]Bet, error) {
-	path := filepath.Join("/data", fmt.Sprintf("agency-%s.csv", agencyID))
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(f)
-	r.FieldsPerRecord = -1
-	rows, err := r.ReadAll()
-	if err != nil {
-		return nil, err
-	}
-
-	var out []Bet
-	// Try to detect header row; if first cell isn't a digit DNI, assume header
-	start := 0
-	if len(rows) > 0 && len(rows[0]) > 0 {
-		// very light heuristic: if header has "documento" or non-digit in col2, skip
-		if rows[0][0] == "nombre" || rows[0][2] == "documento" {
-			start = 1
-		}
-	}
-
-	for i := start; i < len(rows); i++ {
-		c := rows[i]
-		// Defensive: support 4 or 5+ columns
-		if len(c) < 5 {
-			continue
-		}
-		num := 0
-		fmt.Sscanf(c[4], "%d", &num)
-		out = append(out, Bet{
-			// Type set by sender
-			AgencyID:   agencyID,
-			Nombre:     c[0],
-			Apellido:   c[1],
-			Documento:  c[2],
-			Nacimiento: c[3],
-			Numero:     num,
-		})
-	}
-	return out, nil
-}
-
 // Called on SIGTERM to stop gracefully
 func (c *Client) Close() {
 	select {
@@ -88,15 +43,12 @@ func (c *Client) Close() {
 	}
 }
 
-// NewClient Initializes a new client receiving the configuration
-// as a parameter
+// NewClient Initializes a new client
 func NewClient(cfg ClientConfig) *Client {
 	return &Client{config: cfg, stopCh: make(chan struct{})}
 }
 
-// CreateClientSocket Initializes client socket. In case of
-// failure, error is printed in stdout/stderr and exit 1
-// is returned
+// CreateClientSocket Initializes client socket
 func (c *Client) createClientSocket() error {
 	conn, err := net.Dial("tcp", c.config.ServerAddress)
 	if err != nil {
@@ -111,60 +63,191 @@ func (c *Client) createClientSocket() error {
 	return nil
 }
 
-func (c *Client) StartClientLoop() {
-	bets, err := loadAgencyBets(c.config.ID)
-	if err != nil {
-		log.Errorf("action: load_bets | result: fail | client_id: %v | error: %v", c.config.ID, err)
-		return
+// streamAgencyBets reads /data/agency-{ID}.csv incrementally and invokes emit(chunk)
+// with up to maxChunk Bet items (last chunk may be smaller). It never loads the full file.
+func streamAgencyBets(agencyID string, maxChunk int, emit func([]Bet) error) error {
+	if maxChunk <= 0 {
+		maxChunk = 100
 	}
+
+	path := filepath.Join("/data", fmt.Sprintf("agency-%s.csv", agencyID))
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1 // be tolerant
+
+	// Header detection (stream-safe): peek first row and decide
+	first, err := r.Read()
+	if err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	isHeader := false
+	if len(first) >= 3 {
+		// Heuristics: common headers or non-digit DNI column
+		if first[0] == "nombre" || first[2] == "documento" {
+			isHeader = true
+		}
+	}
+	if !isHeader {
+		// Treat first as data row; process it
+		rdata := first
+		if len(rdata) >= 5 {
+			var num int
+			fmt.Sscanf(rdata[4], "%d", &num)
+			b := Bet{
+				AgencyID:   agencyID,
+				Nombre:     rdata[0],
+				Apellido:   rdata[1],
+				Documento:  rdata[2],
+				Nacimiento: rdata[3],
+				Numero:     num,
+			}
+			buf := []Bet{b}
+			// Try to fill the rest of the chunk from the stream before emitting
+			for len(buf) < maxChunk {
+				row, err := r.Read()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return err
+				}
+				if len(row) >= 5 {
+					var num int
+					fmt.Sscanf(row[4], "%d", &num)
+					b := Bet{
+						AgencyID:   agencyID,
+						Nombre:     row[0],
+						Apellido:   row[1],
+						Documento:  row[2],
+						Nacimiento: row[3],
+						Numero:     num,
+					}
+					buf = append(buf, b)
+				}
+			}
+			// Simpler: fall through to unified loop below with a preloaded 'first' item
+			// We'll just start buffer with that item.
+			// To avoid duplicate logic, we’ll use a small helper flow below.
+			// (We’ll implement unified loop that starts with an optional first row.)
+		}
+	}
+
+	// Unified streaming loop
+	buf := make([]Bet, 0, maxChunk)
+	enqueue := func(c []string) {
+		if len(c) < 5 {
+			return
+		}
+		var num int
+		fmt.Sscanf(c[4], "%d", &num)
+		buf = append(buf, Bet{
+			AgencyID:   agencyID,
+			Nombre:     c[0],
+			Apellido:   c[1],
+			Documento:  c[2],
+			Nacimiento: c[3],
+			Numero:     num,
+		})
+	}
+
+	// Seed buffer if first row was data
+	if !isHeader {
+		enqueue(first)
+	}
+
+	for {
+		row, err := r.Read()
+		if err == io.EOF {
+			// flush remaining
+			if len(buf) > 0 {
+				if err := emit(buf); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		enqueue(row)
+
+		if len(buf) >= maxChunk {
+			if err := emit(buf); err != nil {
+				return err
+			}
+			buf = buf[:0] // reuse capacity
+		}
+	}
+}
+
+// StartClientLoop streams the CSV and sends batches as they’re produced.
+// Memory stays bounded to ~BatchMax bets + protocol buffers.
+func (c *Client) StartClientLoop() {
 	if c.config.BatchMax <= 0 {
 		c.config.BatchMax = 100
 	}
 
-	// Walk the bets, sending batches (capped by BatchMax and <=8KB by SendBatches)
-	sent := 0
-	for sent < len(bets) {
-		// stop quickly on SIGTERM
+	sentTotal := 0
+	stopped := false
+
+	emit := func(chunk []Bet) error {
+		// Allow graceful stop between chunks
 		select {
 		case <-c.stopCh:
-			log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
-			return
+			stopped = true
+			return io.EOF
 		default:
 		}
 
-		end := sent + c.config.BatchMax
-		if end > len(bets) {
-			end = len(bets)
-		}
-		chunk := bets[sent:end]
-
+		// Create connection per chunk, send (auto-split to ≤8KB if needed), close
 		if err := c.createClientSocket(); err != nil {
-			return
+			return err
 		}
 		err := sendBatch(c.conn, c.config.ID, chunk)
 		_ = c.conn.Close()
 		if err != nil {
 			log.Errorf("action: apuesta_enviada | result: fail | cantidad: %d | error: %v", len(chunk), err)
-			return
+			return err
 		}
 
 		log.Infof("action: apuesta_enviada | result: success | cantidad: %d", len(chunk))
+		sentTotal += len(chunk)
 
-		sent = end
-
-		// Interruptible pacing between batches
+		// Pacing, but interruptible
 		timer := time.NewTimer(c.config.LoopPeriod)
 		select {
 		case <-c.stopCh:
 			if !timer.Stop() {
 				<-timer.C
 			}
-			log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
-			return
+			stopped = true
+			return io.EOF
 		case <-timer.C:
 		}
+		return nil
 	}
 
+	// Stream the CSV and send as we go
+	if err := streamAgencyBets(c.config.ID, c.config.BatchMax, emit); err != nil && err != io.EOF {
+		log.Errorf("action: load_bets | result: fail | client_id: %v | error: %v", c.config.ID, err)
+		return
+	}
+	if stopped {
+		log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
+		return
+	}
+
+	// DONE + winners polling
 	if err := c.createClientSocket(); err != nil {
 		return
 	}
@@ -175,9 +258,7 @@ func (c *Client) StartClientLoop() {
 	}
 	_ = c.conn.Close()
 
-	// Immediately request winners; server will answer only after all 5 DONEs
 	for {
-		// allow graceful stop
 		select {
 		case <-c.stopCh:
 			log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
@@ -194,7 +275,6 @@ func (c *Client) StartClientLoop() {
 			log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d", len(wr))
 			break
 		}
-		// backoff a bit before retrying
 		time.Sleep(200 * time.Millisecond)
 	}
 
