@@ -98,12 +98,9 @@ func (c *Client) StartClientLoop() {
 			Numero:     num,
 		}
 
-		ack, err := SendBet(c.conn, bet)
+		err := SendBet(c.conn, *bet)
 		_ = c.conn.Close()
-		if err != nil || !ack.OK {
-			if err == nil {
-				err = fmt.Errorf(ack.Error)
-			}
+		if err != nil {
 			log.Errorf("action: apuesta_enviada | result: fail | dni: %s | numero: %d | error: %v", dni, num, err)
 			return
 		}

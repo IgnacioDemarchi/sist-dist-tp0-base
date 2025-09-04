@@ -2,14 +2,14 @@ package common
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 )
 
 func writeFrame(conn net.Conn, payload []byte) error {
-	if len(payload) > 8*1024 { // cop-out limit; increase if you like
+	if len(payload) > 8*1024 {
 		return fmt.Errorf("payload too big: %d", len(payload))
 	}
 	var hdr [4]byte
@@ -45,42 +45,62 @@ func readFrame(conn net.Conn) ([]byte, error) {
 	return buf, nil
 }
 
-// --- JSON message types ---
+// ------- domain types  -------
 type Bet struct {
-	Type       string `json:"type"` // "BET"
-	AgencyID   string `json:"agency_id"`
-	Nombre     string `json:"nombre"`
-	Apellido   string `json:"apellido"`
-	Documento  string `json:"documento"`
-	Nacimiento string `json:"nacimiento"` // "YYYY-MM-DD"
-	Numero     int    `json:"numero"`
+	AgencyID   string
+	Nombre     string
+	Apellido   string
+	Documento  string
+	Nacimiento string // YYYY-MM-DD
+	Numero     int
 }
 
-type Ack struct {
-	Type  string `json:"type"` // "ACK"
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+// ------- line encoding / parsing -------
+func encodeBetLine(b Bet) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%d",
+		b.AgencyID, b.Nombre, b.Apellido, b.Documento, b.Nacimiento, b.Numero)
 }
 
-func SendBet(conn net.Conn, b *Bet) (*Ack, error) {
-	b.Type = "BET"
-	js, err := json.Marshal(b)
+func sendLine(conn net.Conn, typ string, parts ...string) error {
+	line := typ
+	for _, p := range parts {
+		line += "|" + p
+	}
+	line += "\n"
+	return writeFrame(conn, []byte(line))
+}
+
+func readLine(conn net.Conn) (string, []string, error) {
+	pkt, err := readFrame(conn)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if err := writeFrame(conn, js); err != nil {
-		return nil, err
+	line := strings.TrimRight(string(pkt), "\r\n")
+	fields := strings.Split(line, "|")
+	if len(fields) == 0 {
+		return "", nil, fmt.Errorf("empty line")
 	}
-	resp, err := readFrame(conn)
+	return fields[0], fields[1:], nil
+}
+
+// ------- single bet -------
+func SendBet(conn net.Conn, b Bet) error {
+	if err := sendLine(conn, "BET", encodeBetLine(b)); err != nil {
+		return err
+	}
+	typ, parts, err := readLine(conn)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var ack Ack
-	if err := json.Unmarshal(resp, &ack); err != nil {
-		return nil, err
+	if typ != "ACK" {
+		return fmt.Errorf("unexpected reply: %s", typ)
 	}
-	if ack.Type != "ACK" {
-		return nil, fmt.Errorf("unexpected reply type: %s", ack.Type)
+	if len(parts) >= 1 && parts[0] == "OK" {
+		return nil
 	}
-	return &ack, nil
+	reason := ""
+	if len(parts) >= 2 {
+		reason = parts[1]
+	}
+	return fmt.Errorf("server NACK: %s", reason)
 }

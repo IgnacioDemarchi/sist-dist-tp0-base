@@ -1,6 +1,6 @@
 import socket
 import logging
-from common.comm import recv_json, send_json 
+from common.comm import recv_line, send_line 
 from common.utils import Bet, store_bets
 class Server:
     def __init__(self, port, listen_backlog):
@@ -36,49 +36,43 @@ class Server:
         try:
             while True:
                 try:
-                    msg = recv_json(client_sock)
+                    line = recv_line(client_sock)
                 except EOFError:
                     break  # client closed
                 except Exception as e:
                     logging.error(f"action: recv | result: fail | error: {e}")
                     break
 
-                mtype = msg.get("type")
-                if mtype != "BET":
+                parts = line.split("|")
+                typ, rest = parts[0], parts[1:]
+
+                if typ != "BET":
                     # Unknown or missing type → negative ACK
                     try:
-                        send_json(client_sock, {"type": "ACK", "ok": False, "error": "unknown message type"})
-                    except Exception:
-                        pass
+                        send_line(client_sock, f"ACK|ERR|unknown message type")
+                    except Exception as e:
+                        logging.error(f"action: recv | result: fail | error: unknown message type {e}")
                     continue
+
+                if len(rest) < 1:
+                    send_line(client_sock, "ACK|ERR|bad_row")
+                    continue
+                f = rest[0].split("|")
+                if len(f) < 6:
+                    send_line(client_sock, "ACK|ERR|bad_row")
+                    continue
+                agency, nombre, apellido, documento, nacimiento, numero = f[:6]
 
                 # Map fields from client payload to Bet(...)
                 try:
-                    bet = Bet(
-                        agency=msg.get("agency_id", "0"),
-                        first_name=msg.get("nombre", ""),
-                        last_name=msg.get("apellido", ""),
-                        document=msg.get("documento", ""),
-                        birthdate=msg.get("nacimiento", "1970-01-01"),
-                        number=str(msg.get("numero", 0)),
-                    )
-                    store_bets([bet])
-
-                    logging.info(
-                        f"action: apuesta_almacenada | result: success | dni: {bet.document} | numero: {bet.number}"
-                    )
-
-                    send_json(client_sock, {"type": "ACK", "ok": True})
-
+                    b = Bet(agency, nombre, apellido, documento, nacimiento, numero)
+                    store_bets([b])
+                    logging.info(f"action: apuesta_almacenada | result: success | dni: {b.document} | numero: {b.number}")
+                    send_line(client_sock, "ACK|OK")
                 except Exception as e:
-                    logging.error(
-                        f"action: apuesta_almacenada | result: fail | dni: {msg.get('documento','')} "
-                        f"| numero: {msg.get('numero',0)} | error: {e}"
-                    )
-                    try:
-                        send_json(client_sock, {"type": "ACK", "ok": False, "error": str(e)})
-                    except Exception:
-                        pass
+                    logging.error(f"action: apuesta_almacenada | result: fail | dni: {documento} | numero: {numero} | error: {e}")
+                    send_line(client_sock, "ACK|ERR|persist_fail")
+                continue
 
         except OSError as e:
             logging.error(f"action: client_handler | result: fail | error: {e}")

@@ -4,3 +4,10 @@
 # Executables
 bin/
 .vscode/
+
+# Data
+.data/
+
+# Yaml
+*.yml
+*.yaml
