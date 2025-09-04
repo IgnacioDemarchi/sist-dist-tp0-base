@@ -30,8 +30,9 @@ class Server:
     def __handle_client_connection(self, client_sock):
         """
         Receive length-prefixed text frames (UTF-8 lines).
-        Accept BET messages, persist them, ACK, and keep going
-        until client closes connection.
+        Supports:
+        - BET|agency|nombre|apellido|documento|nacimiento|numero
+        - BATCH|agency|count   (followed by <count> BET lines)
         """
         try:
             while True:
@@ -46,61 +47,98 @@ class Server:
                 parts = line.split("|")
                 typ, rest = parts[0], parts[1:]
 
-                if typ == "BATCH_BET":
+                # ---------- BATCH header ----------
+                if typ == "BATCH":
+                    if len(rest) < 2:
+                        try:
+                            send_line(client_sock, "ACK_BATCH|ERR|bad_header")
+                        except Exception:
+                            pass
+                        continue
                     agency = rest[0]
-                    rows = rest[1:]
-                    count = len(rows)
                     try:
-                        bets = []
-                        for b in rows:
-                            bet = Bet(
-                                agency=agency,
-                                first_name=b.get("nombre", ""),
-                                last_name=b.get("apellido", ""),
-                                document=b.get("documento", ""),
-                                birthdate=b.get("nacimiento", ""),
-                                number=str(b.get("numero", 0)),
-                            )
-                            bets.append(bet)
+                        count = int(rest[1])
+                        if count < 0:
+                            raise ValueError("negative")
+                    except Exception:
+                        try:
+                            send_line(client_sock, "ACK_BATCH|ERR|bad_count")
+                        except Exception:
+                            pass
+                        continue
 
-                        # persist atomically
+                    bets = []
+                    ok = True
+                    err_reason = ""
+                    for _ in range(count):
+                        try:
+                            bet_line = recv_line(client_sock)
+                        except Exception as e:
+                            ok = False
+                            err_reason = f"recv_bet: {e}"
+                            break
+                        f = bet_line.split("|")
+                        if len(f) < 7 or f[0] != "BET":
+                            ok = False
+                            err_reason = "bad_bet_line"
+                            break
+                        _, a, nombre, apellido, documento, nacimiento, numero = f[:7]
+                        try:
+                            b = Bet(a, nombre, apellido, documento, nacimiento, numero)
+                            bets.append(b)
+                        except Exception as e:
+                            ok = False
+                            err_reason = f"parse_bet: {e}"
+                            break
+
+                    if not ok:
+                        logging.error(f"action: apuesta_recibida | result: fail | cantidad: {count} | error: {err_reason}")
+                        try:
+                            send_line(client_sock, f"ACK_BATCH|ERR|{err_reason}")
+                        except Exception:
+                            pass
+                        continue
+
+                    try:
                         store_bets(bets)
-
                         logging.info(f"action: apuesta_recibida | result: success | cantidad: {count}")
-
-                        send_line(client_sock, {"type": "ACK_BATCH", "ok": True, "count": count})
-
+                        send_line(client_sock, f"ACK_BATCH|OK|{count}")
                     except Exception as e:
                         logging.error(f"action: apuesta_recibida | result: fail | cantidad: {count} | error: {e}")
-                        send_line(client_sock, {"type": "ACK_BATCH", "ok": False, "count": count, "error": str(e)})
+                        try:
+                            send_line(client_sock, f"ACK_BATCH|ERR|persist_fail")
+                        except Exception:
+                            pass
                     continue
 
-
+                # ---------- Single BET ----------
                 if typ != "BET":
                     # Unknown or missing type → negative ACK
                     try:
-                        send_line(client_sock, f"ACK|ERR|unknown message type")
+                        send_line(client_sock, "ACK|ERR|unknown message type")
                     except Exception as e:
                         logging.error(f"action: recv | result: fail | error: unknown message type {e}")
                     continue
 
-
                 if len(rest) < 6:
                     send_line(client_sock, "ACK|ERR|bad_row")
                     continue
+
                 agency, nombre, apellido, documento, nacimiento, numero = rest[:6]
 
-                # Map fields from client payload to Bet(...)
                 try:
                     b = Bet(agency, nombre, apellido, documento, nacimiento, numero)
                     store_bets([b])
-                    logging.info(f"action: apuesta_almacenada | result: success | dni: {b.document} | numero: {b.number}")
+                    logging.info(
+                        f"action: apuesta_almacenada | result: success | dni: {b.document} | numero: {b.number}"
+                    )
                     send_line(client_sock, "ACK|OK")
                 except Exception as e:
-                    logging.error(f"action: apuesta_almacenada | result: fail | dni: {documento} | numero: {numero} | error: {e}")
+                    logging.error(
+                        f"action: apuesta_almacenada | result: fail | dni: {documento} | numero: {numero} | error: {e}"
+                    )
                     send_line(client_sock, "ACK|ERR|persist_fail")
-                continue
-                            
+
         except OSError as e:
             logging.error(f"action: client_handler | result: fail | error: {e}")
         finally:
