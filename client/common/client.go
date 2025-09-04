@@ -141,12 +141,9 @@ func (c *Client) StartClientLoop() {
 		if err := c.createClientSocket(); err != nil {
 			return
 		}
-		ack, err := SendBatches(c.conn, c.config.ID, chunk)
+		err := SendBatches(c.conn, c.config.ID, chunk)
 		_ = c.conn.Close()
-		if err != nil || ack == nil || !ack.OK {
-			if err == nil {
-				err = fmt.Errorf("server nack or nil ack")
-			}
+		if err != nil {
 			log.Errorf("action: apuesta_enviada | result: fail | cantidad: %d | error: %v", len(chunk), err)
 			return
 		}

@@ -2,19 +2,19 @@ package common
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 )
 
+// ------- framing --------
 func writeFrame(conn net.Conn, payload []byte) error {
-	if len(payload) > 8*1024 { // cop-out limit; increase if you like
+	if len(payload) > 8*1024 {
 		return fmt.Errorf("payload too big: %d", len(payload))
 	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-	// sendall: header first, then body
 	if _, err := conn.Write(hdr[:]); err != nil {
 		return err
 	}
@@ -45,115 +45,114 @@ func readFrame(conn net.Conn) ([]byte, error) {
 	return buf, nil
 }
 
-// --- JSON message types ---
+// ------- domain types -------
 type Bet struct {
-	Type       string `json:"type"` // "BET"
-	AgencyID   string `json:"agency_id"`
-	Nombre     string `json:"nombre"`
-	Apellido   string `json:"apellido"`
-	Documento  string `json:"documento"`
-	Nacimiento string `json:"nacimiento"` // "YYYY-MM-DD"
-	Numero     int    `json:"numero"`
+	AgencyID   string
+	Nombre     string
+	Apellido   string
+	Documento  string
+	Nacimiento string // YYYY-MM-DD
+	Numero     int
 }
 
-type Ack struct {
-	Type  string `json:"type"` // "ACK"
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+// ------- line encoding / parsing -------
+func encodeBetLine(b Bet) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%d",
+		b.AgencyID, b.Nombre, b.Apellido, b.Documento, b.Nacimiento, b.Numero)
 }
 
-func SendBet(conn net.Conn, b *Bet) (*Ack, error) {
-	b.Type = "BET"
-	js, err := json.Marshal(b)
+func sendLine(conn net.Conn, typ string, parts ...string) error {
+	line := typ
+	for _, p := range parts {
+		line += "|" + p
+	}
+	line += "\n"
+	return writeFrame(conn, []byte(line))
+}
+
+func readLine(conn net.Conn) (string, []string, error) {
+	pkt, err := readFrame(conn)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if err := writeFrame(conn, js); err != nil {
-		return nil, err
+	line := strings.TrimRight(string(pkt), "\r\n")
+	fields := strings.Split(line, "|")
+	if len(fields) == 0 {
+		return "", nil, fmt.Errorf("empty line")
 	}
-	resp, err := readFrame(conn)
+	return fields[0], fields[1:], nil
+}
+
+// ------- single bet -------
+func SendBet(conn net.Conn, b Bet) error {
+	if err := sendLine(conn, "BET", encodeBetLine(b)); err != nil {
+		return err
+	}
+	typ, parts, err := readLine(conn)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var ack Ack
-	if err := json.Unmarshal(resp, &ack); err != nil {
-		return nil, err
+	if typ != "ACK" {
+		return fmt.Errorf("unexpected reply: %s", typ)
 	}
-	if ack.Type != "ACK" {
-		return nil, fmt.Errorf("unexpected reply type: %s", ack.Type)
+	if len(parts) >= 1 && parts[0] == "OK" {
+		return nil
 	}
-	return &ack, nil
+	reason := ""
+	if len(parts) >= 2 {
+		reason = parts[1]
+	}
+	return fmt.Errorf("server NACK: %s", reason)
 }
 
-// ---------- Batching ----------
+// ------- batch (auto split by size if needed) -------
+const maxPayload = 8 * 1024
 
-type Batch struct {
-	Type     string `json:"type"` // "BATCH_BET"
-	AgencyID string `json:"agency_id"`
-	Bets     []Bet  `json:"bets"`
-}
-
-type BatchAck struct {
-	Type  string `json:"type"` // "ACK_BATCH"
-	OK    bool   `json:"ok"`
-	Count int    `json:"count"`
-	Error string `json:"error,omitempty"`
-}
-
-const maxPayload = 8 * 1024 // must match server cap
-
-func SendBatchBet(conn net.Conn, agencyID string, bets []Bet) (*BatchAck, [][]Bet, error) {
-	// Try to send all; if too big, split until it fits.
-	l, r := 0, len(bets)
-	var lastGood int
-	for l < r {
-		payload := Batch{Type: "BATCH_BET", AgencyID: agencyID, Bets: bets[l:r]}
-		js, err := json.Marshal(payload)
-		if err != nil {
-			return nil, nil, err
-		}
-		if len(js) <= maxPayload {
-			// fits → send it
-			if err := writeFrame(conn, js); err != nil {
-				return nil, nil, err
-			}
-			resp, err := readFrame(conn)
-			if err != nil {
-				return nil, nil, err
-			}
-			var ack BatchAck
-			if err := json.Unmarshal(resp, &ack); err != nil {
-				return nil, nil, err
-			}
-			if ack.Type != "ACK_BATCH" {
-				return nil, nil, fmt.Errorf("unexpected reply type: %s", ack.Type)
-			}
-			// remaining batches (if any) are none because we tried to send all at once
-			return &ack, nil, nil
-		}
-		// Too big: reduce window by halving
-		lastGood = (l + r) / 2
-		if lastGood <= l {
-			// Single item too large: fail fast (shouldn't happen with small bets)
-			return nil, nil, fmt.Errorf("single bet too large to fit frame")
-		}
-		r = lastGood
+// Sends one batch header + lines (no auto-splitting)
+func sendRawBatch(conn net.Conn, agencyID string, bets []Bet) error {
+	header := fmt.Sprintf("BATCH|%s|%d\n", agencyID, len(bets))
+	body := header
+	for _, b := range bets {
+		body += encodeBetLine(b) + "\n"
 	}
-	return nil, nil, fmt.Errorf("unexpected batching logic failure")
+	if len(body) > maxPayload {
+		return fmt.Errorf("batch too large: %d", len(body))
+	}
+	if err := writeFrame(conn, []byte(body)); err != nil {
+		return err
+	}
+	typ, parts, err := readLine(conn)
+	if err != nil {
+		return err
+	}
+	if typ != "ACK_BATCH" {
+		return fmt.Errorf("unexpected reply: %s", typ)
+	}
+	if len(parts) >= 1 && parts[0] == "OK" {
+		return nil
+	}
+	reason := ""
+	if len(parts) >= 3 {
+		reason = parts[2]
+	}
+	return fmt.Errorf("server NACK batch: %s", reason)
 }
 
-// Helper: split bets into many <=8KB batches and send them one by one.
-func SendBatches(conn net.Conn, agencyID string, bets []Bet) (*BatchAck, error) {
+// Split bets into multiple frames (<=8KB each) and send sequentially.
+func SendBatches(conn net.Conn, agencyID string, bets []Bet) error {
 	i := 0
 	for i < len(bets) {
-		// Find the largest sub-slice starting at i that fits
+		// binary search largest sub-slice starting at i that fits
 		lo, hi := i+1, len(bets)+1
 		best := -1
 		for lo < hi {
 			mid := (lo + hi) / 2
-			payload := Batch{Type: "BATCH_BET", AgencyID: agencyID, Bets: bets[i:mid]}
-			js, _ := json.Marshal(payload)
-			if len(js) <= maxPayload {
+			header := fmt.Sprintf("BATCH|%s|%d\n", agencyID, mid-i)
+			body := header
+			for _, b := range bets[i:mid] {
+				body += encodeBetLine(b) + "\n"
+			}
+			if len(body) <= maxPayload {
 				best = mid
 				lo = mid + 1
 			} else {
@@ -161,15 +160,12 @@ func SendBatches(conn net.Conn, agencyID string, bets []Bet) (*BatchAck, error) 
 			}
 		}
 		if best == -1 {
-			return nil, fmt.Errorf("cannot fit any bet into frame at index %d", i)
+			return fmt.Errorf("cannot fit bet at index %d", i)
 		}
-		// send this chunk
-		chunk := bets[i:best]
-		if _, _, err := SendBatchBet(conn, agencyID, chunk); err != nil {
-			return nil, err
+		if err := sendRawBatch(conn, agencyID, bets[i:best]); err != nil {
+			return err
 		}
 		i = best
 	}
-	// Return a synthetic success ack with total count
-	return &BatchAck{Type: "ACK_BATCH", OK: true, Count: len(bets)}, nil
+	return nil
 }
