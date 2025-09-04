@@ -1,7 +1,7 @@
 import socket
 import logging
 from common.comm import recv_json, send_json 
-from common.utils import Bet, store_bets
+from common.utils import Bet, store_bets, load_bets, has_won
 class Server:
     def __init__(self, port, listen_backlog):
         # Initialize server socket
@@ -11,6 +11,9 @@ class Server:
         self._server_socket.listen(listen_backlog)
         self._server_socket.settimeout(0.5)  # periodic wake to check stop
         self._stopping = False    
+        self._done_agencies = set()
+        self._draw_completed = False
+        self._winners_by_agency = {}
 
     def run(self):
         """
@@ -43,7 +46,31 @@ class Server:
                     logging.error(f"action: recv | result: fail | error: {e}")
                     break
 
-                if msg.get("type") == "BATCH_BET":
+                mtype = msg.get("type")
+
+                # ----- DONE -----
+                if mtype == "DONE":
+                    agency = str(msg.get("agency_id", "0"))
+                    self._done_agencies.add(agency)
+                    self._perform_draw_if_ready()
+                    try:
+                        send_json(client_sock, {"type": "ACK_DONE", "ok": True})
+                    except Exception:
+                        pass
+                    continue
+
+                # ----- GET_WINNERS -----
+                if mtype == "GET_WINNERS":
+                    agency = str(msg.get("agency_id", "0"))
+                    if not self._draw_completed:
+                        send_json(client_sock, {"type": "WINNERS", "ok": False, "error": "not_ready"})
+                        continue
+                    dnis = self._winners_by_agency.get(agency, [])
+                    send_json(client_sock, {"type": "WINNERS", "ok": True, "dnis": dnis})
+                    continue
+
+
+                if mtype == "BATCH_BET":
                     agency = msg.get("agency_id", "0")
                     rows = msg.get("bets", [])
                     count = len(rows)
@@ -73,7 +100,6 @@ class Server:
                     continue
 
 
-                mtype = msg.get("type")
                 if mtype != "BET":
                     # Unknown or missing type → negative ACK
                     try:
@@ -138,3 +164,24 @@ class Server:
             self._server_socket.close()  # unblocks accept()
         except OSError:
             pass
+        
+    def _perform_draw_if_ready(self):
+        if self._draw_completed:
+            return
+        # Wait until we have the 5 agencies
+        if len(self._done_agencies) < 5:
+            return
+
+        # Build winners per agency from persisted bets
+        winners = {}
+        try:
+            for bet in load_bets():
+                if has_won(bet):
+                    winners.setdefault(str(bet.agency), []).append(str(bet.document))
+        except Exception as e:
+            logging.error(f"action: sorteo | result: fail | error: {e}")
+            return
+
+        self._winners_by_agency = winners
+        self._draw_completed = True
+        logging.info("action: sorteo | result: success")

@@ -168,5 +168,38 @@ func (c *Client) StartClientLoop() {
 		}
 	}
 
+	if err := c.createClientSocket(); err != nil {
+		return
+	}
+	if err := SendDone(c.conn, c.config.ID); err != nil {
+		_ = c.conn.Close()
+		log.Errorf("action: done | result: fail | client_id: %v | error: %v", c.config.ID, err)
+		return
+	}
+	_ = c.conn.Close()
+
+	// Immediately request winners; server will answer only after all 5 DONEs
+	for {
+		// allow graceful stop
+		select {
+		case <-c.stopCh:
+			log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
+			return
+		default:
+		}
+
+		if err := c.createClientSocket(); err != nil {
+			return
+		}
+		wr, err := RequestWinners(c.conn, c.config.ID)
+		_ = c.conn.Close()
+		if err == nil && wr.OK {
+			log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d", len(wr.DNIs))
+			break
+		}
+		// backoff a bit before retrying
+		time.Sleep(200 * time.Millisecond)
+	}
+
 	log.Infof("action: loop_finished | result: success | client_id: %v", c.config.ID)
 }

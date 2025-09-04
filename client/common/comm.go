@@ -173,3 +173,68 @@ func SendBatches(conn net.Conn, agencyID string, bets []Bet) (*BatchAck, error) 
 	// Return a synthetic success ack with total count
 	return &BatchAck{Type: "ACK_BATCH", OK: true, Count: len(bets)}, nil
 }
+
+type Done struct {
+	Type     string `json:"type"` // "DONE"
+	AgencyID string `json:"agency_id"`
+}
+type AckDone struct {
+	Type string `json:"type"` // "ACK_DONE"
+	OK   bool   `json:"ok"`
+}
+type GetWinners struct {
+	Type     string `json:"type"` // "GET_WINNERS"
+	AgencyID string `json:"agency_id"`
+}
+type WinnersResp struct {
+	Type  string   `json:"type"` // "WINNERS"
+	OK    bool     `json:"ok"`
+	DNIs  []string `json:"dnis,omitempty"`
+	Error string   `json:"error,omitempty"`
+}
+
+func SendDone(conn net.Conn, agencyID string) error {
+	req := Done{Type: "DONE", AgencyID: agencyID}
+	js, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	if err := writeFrame(conn, js); err != nil {
+		return err
+	}
+	resp, err := readFrame(conn)
+	if err != nil {
+		return err
+	}
+	var ack AckDone
+	if err := json.Unmarshal(resp, &ack); err != nil {
+		return err
+	}
+	if ack.Type != "ACK_DONE" || !ack.OK {
+		return fmt.Errorf("ack_done not ok")
+	}
+	return nil
+}
+
+func RequestWinners(conn net.Conn, agencyID string) (*WinnersResp, error) {
+	req := GetWinners{Type: "GET_WINNERS", AgencyID: agencyID}
+	js, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFrame(conn, js); err != nil {
+		return nil, err
+	}
+	resp, err := readFrame(conn)
+	if err != nil {
+		return nil, err
+	}
+	var wr WinnersResp
+	if err := json.Unmarshal(resp, &wr); err != nil {
+		return nil, err
+	}
+	if wr.Type != "WINNERS" {
+		return nil, fmt.Errorf("unexpected reply type: %s", wr.Type)
+	}
+	return &wr, nil
+}
