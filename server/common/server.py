@@ -1,5 +1,6 @@
 import socket
 import logging
+import os
 from common.comm import recv_json, send_json 
 from common.utils import Bet, store_bets, load_bets, has_won
 class Server:
@@ -14,6 +15,11 @@ class Server:
         self._done_agencies = set()
         self._draw_completed = False
         self._winners_by_agency = {}
+        try:
+            self._expected_agencies = int(os.getenv("CLIENT_AMOUNT", "5"))
+        except Exception:
+            self._expected_agencies = 5
+        
 
     def run(self):
         """
@@ -168,8 +174,8 @@ class Server:
     def _perform_draw_if_ready(self):
         if self._draw_completed:
             return
-        # Wait until we have the 5 agencies
-        if len(self._done_agencies) < 5:
+        # Wait until we have the expected agencies
+        if len(self._done_agencies) < self._expected_agencies:
             return
 
         # Build winners per agency from persisted bets
