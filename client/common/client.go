@@ -78,9 +78,9 @@ func streamAgencyBets(agencyID string, maxChunk int, emit func([]Bet) error) err
 	defer f.Close()
 
 	r := csv.NewReader(f)
-	r.FieldsPerRecord = -1 // be tolerant
+	r.FieldsPerRecord = -1 // tolerant
 
-	// Header detection (stream-safe): peek first row and decide
+	// Read first row to decide header vs data — do NOT pre-fill or consume more.
 	first, err := r.Read()
 	if err == io.EOF {
 		return nil
@@ -91,58 +91,13 @@ func streamAgencyBets(agencyID string, maxChunk int, emit func([]Bet) error) err
 
 	isHeader := false
 	if len(first) >= 3 {
-		// Heuristics: common headers or non-digit DNI column
 		if first[0] == "nombre" || first[2] == "documento" {
 			isHeader = true
 		}
 	}
-	if !isHeader {
-		// Treat first as data row; process it
-		rdata := first
-		if len(rdata) >= 5 {
-			var num int
-			fmt.Sscanf(rdata[4], "%d", &num)
-			b := Bet{
-				AgencyID:   agencyID,
-				Nombre:     rdata[0],
-				Apellido:   rdata[1],
-				Documento:  rdata[2],
-				Nacimiento: rdata[3],
-				Numero:     num,
-			}
-			buf := []Bet{b}
-			// Try to fill the rest of the chunk from the stream before emitting
-			for len(buf) < maxChunk {
-				row, err := r.Read()
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					return err
-				}
-				if len(row) >= 5 {
-					var num int
-					fmt.Sscanf(row[4], "%d", &num)
-					b := Bet{
-						AgencyID:   agencyID,
-						Nombre:     row[0],
-						Apellido:   row[1],
-						Documento:  row[2],
-						Nacimiento: row[3],
-						Numero:     num,
-					}
-					buf = append(buf, b)
-				}
-			}
-			// Simpler: fall through to unified loop below with a preloaded 'first' item
-			// We'll just start buffer with that item.
-			// To avoid duplicate logic, we’ll use a small helper flow below.
-			// (We’ll implement unified loop that starts with an optional first row.)
-		}
-	}
 
-	// Unified streaming loop
 	buf := make([]Bet, 0, maxChunk)
+
 	enqueue := func(c []string) {
 		if len(c) < 5 {
 			return
@@ -159,7 +114,7 @@ func streamAgencyBets(agencyID string, maxChunk int, emit func([]Bet) error) err
 		})
 	}
 
-	// Seed buffer if first row was data
+	// Seed with first row if it's data.
 	if !isHeader {
 		enqueue(first)
 	}
