@@ -109,19 +109,24 @@ func SendBet(conn net.Conn, b Bet) error {
 // ------- batch (auto split by size if needed) -------
 const maxPayload = 8 * 1024
 
-// Sends one batch header + lines (no auto-splitting)
-func sendRawBatch(conn net.Conn, agencyID string, bets []Bet) error {
+// Sends one batch: header frame + N field-only frames, then waits for ACK_BATCH
+func sendBatch(conn net.Conn, agencyID string, bets []Bet) error {
+	// Header (one frame)
 	header := fmt.Sprintf("BATCH|%s|%d\n", agencyID, len(bets))
-	body := header
-	for _, b := range bets {
-		body += encodeBetLine(b) + "\n"
-	}
-	if len(body) > maxPayload {
-		return fmt.Errorf("batch too large: %d", len(body))
-	}
-	if err := writeFrame(conn, []byte(body)); err != nil {
+	if err := writeFrame(conn, []byte(header)); err != nil {
 		return err
 	}
+
+	// N bet lines, each as its own frame:
+	// nombre|apellido|documento|nacimiento|numero
+	for _, b := range bets {
+		line := fmt.Sprintf("%s|%s|%s|%s|%d\n", b.Nombre, b.Apellido, b.Documento, b.Nacimiento, b.Numero)
+		if err := writeFrame(conn, []byte(line)); err != nil {
+			return err
+		}
+	}
+
+	// ACK
 	typ, parts, err := readLine(conn)
 	if err != nil {
 		return err
@@ -130,7 +135,6 @@ func sendRawBatch(conn net.Conn, agencyID string, bets []Bet) error {
 		return fmt.Errorf("unexpected reply: %s", typ)
 	}
 	if len(parts) >= 1 && parts[0] == "OK" {
-		// optional: check count
 		return nil
 	}
 	reason := ""
@@ -164,7 +168,7 @@ func SendBatches(conn net.Conn, agencyID string, bets []Bet) error {
 		if best == -1 {
 			return fmt.Errorf("cannot fit bet at index %d", i)
 		}
-		if err := sendRawBatch(conn, agencyID, bets[i:best]); err != nil {
+		if err := sendBatch(conn, agencyID, bets[i:best]); err != nil {
 			return err
 		}
 		i = best
