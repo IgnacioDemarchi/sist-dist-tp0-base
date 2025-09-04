@@ -13,14 +13,14 @@ func writeFrame(conn net.Conn, payload []byte) error {
 	if len(payload) > 8*1024 {
 		return fmt.Errorf("payload too big: %d", len(payload))
 	}
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := conn.Write(hdr[:]); err != nil {
-		return err
-	}
-	off := 0
-	for off < len(payload) {
-		n, err := conn.Write(payload[off:])
+	// Allocate one contiguous buffer
+	buf := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(payload)))
+	copy(buf[4:], payload)
+
+	// Write in a loop to handle short writes
+	for off := 0; off < len(buf); {
+		n, err := conn.Write(buf[off:])
 		if err != nil {
 			return err
 		}

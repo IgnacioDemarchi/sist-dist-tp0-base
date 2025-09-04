@@ -23,8 +23,8 @@ def recv_frame(sock: socket.socket) -> bytes:
 def send_frame(sock: socket.socket, payload: bytes) -> None:
     if len(payload) > _MAX:
         raise ValueError(f"payload too large {len(payload)}")
-    sock.sendall(struct.pack("!I", len(payload)))
-    sock.sendall(payload)
+    header = struct.pack("!I", len(payload))
+    sock.sendall(header + payload)
 
 def recv_line(sock) -> str:
     return recv_frame(sock).decode("utf-8").rstrip("\r\n")
