@@ -19,6 +19,7 @@ class Server:
             self._expected_agencies = int(os.getenv("CLIENT_AMOUNT", "5"))
         except Exception:
             self._expected_agencies = 5
+        logging.debug(f"action: draw_config | result: success | expected_agencies: {self._expected_agencies}")
         
 
     def run(self):
