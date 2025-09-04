@@ -29,7 +29,7 @@ class Server:
 
     def __handle_client_connection(self, client_sock):
         """
-        Receive length-prefixed JSON frames.
+        Receive length-prefixed text frames (UTF-8 lines).
         Accept BET messages, persist them, ACK, and keep going
         until client closes connection.
         """
@@ -54,14 +54,11 @@ class Server:
                         logging.error(f"action: recv | result: fail | error: unknown message type {e}")
                     continue
 
-                if len(rest) < 1:
+
+                if len(rest) < 6:
                     send_line(client_sock, "ACK|ERR|bad_row")
                     continue
-                f = rest[0].split("|")
-                if len(f) < 6:
-                    send_line(client_sock, "ACK|ERR|bad_row")
-                    continue
-                agency, nombre, apellido, documento, nacimiento, numero = f[:6]
+                agency, nombre, apellido, documento, nacimiento, numero = rest[:6]
 
                 # Map fields from client payload to Bet(...)
                 try:
