@@ -67,7 +67,7 @@ class Server:
 
                 signal.signal(signal.SIGTERM, _graceful_stop)
                 signal.signal(signal.SIGINT, _graceful_stop)
-                logging.debug("action: signal_handlers | result: installed")
+                logging.debug("action: signal_handlers | result: success")
                 self._signals_installed = True
             else:
                 logging.debug("action: signal_handlers | result: skipped | reason: not_main_thread")
