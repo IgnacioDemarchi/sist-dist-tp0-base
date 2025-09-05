@@ -12,10 +12,11 @@ class Server:
         self._server_socket.bind(('', port))
         self._server_socket.listen(listen_backlog)
         self._server_socket.settimeout(0.5)  # periodic wake to check stop
-        self._stopping = False    
+        self._stopping = False
         self._done_agencies = set()
         self._draw_completed = False
         self._winners_by_agency = {}
+
         self._expected_agencies_env = None
         val = os.getenv("CLIENT_AMOUNT")
         if val and val.strip():
@@ -23,12 +24,21 @@ class Server:
                 self._expected_agencies_env = int(val)
             except Exception:
                 pass
-
         self._expected_agencies = self._expected_agencies_env  # may be None
+
         logging.debug(
             f"action: draw_config | result: success | expected_agencies: {self._expected_agencies or 'dynamic'}"
         )
-        self._lock = threading.RLock()
+
+        # Locks
+        # - _persist_lock: serialize access to non-thread-safe persistence (store_bets/load_bets)
+        # - _state_lock: protect in-memory coordination state
+        # - _workers_lock: protect the worker set
+        self._persist_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._workers_lock = threading.Lock()
+
+        # Worker pool (best-effort cap)
         self._workers = set()
         self._max_workers = 64
 
@@ -44,25 +54,25 @@ class Server:
                 break
 
             self._reap_workers()
-            if len(self._workers) >= self._max_workers:
-                try:
-                    client_sock.close()
-                except OSError:
-                    pass
-                continue
+            with self._workers_lock:
+                if len(self._workers) >= self._max_workers:
+                    try:
+                        client_sock.close()
+                    except OSError:
+                        pass
+                    continue
 
-            t = threading.Thread(
-                target=self.__handle_client_connection,
-                args=(client_sock,),
-                daemon=True,
-            )
-            with self._lock:
+                t = threading.Thread(
+                    target=self.__handle_client_connection,
+                    args=(client_sock,),
+                    daemon=True,
+                )
                 self._workers.add(t)
             t.start()
 
     def _reap_workers(self):
         # Remove finished threads from the set
-        with self._lock:
+        with self._workers_lock:
             dead = {t for t in self._workers if not t.is_alive()}
             if dead:
                 self._workers.difference_update(dead)
@@ -79,17 +89,22 @@ class Server:
 
                 if typ == "DONE":
                     agency = rest[0] if rest else "0"
-                    self._done_agencies.add(agency)
+                    # Update DONE set under state lock
+                    with self._state_lock:
+                        self._done_agencies.add(agency)
+                    # Check if we can perform the draw
                     self._perform_draw_if_ready()
                     send_line(client_sock, "ACK_DONE|OK")
                     continue
 
                 if typ == "GET_WINNERS":
                     agency = rest[0] if rest else "0"
-                    if not self._draw_completed:
+                    with self._state_lock:
+                        draw_ready = self._draw_completed
+                        dnis = list(self._winners_by_agency.get(agency, []))
+                    if not draw_ready:
                         send_line(client_sock, "WINNERS|ERR|not_ready")
                         continue
-                    dnis = self._winners_by_agency.get(agency, [])
                     payload = "WINNERS|OK|" + ",".join(map(str, dnis))
                     send_line(client_sock, payload)
                     continue
@@ -132,7 +147,9 @@ class Server:
 
                     if ok:
                         try:
-                            store_bets(bets)
+                            # Serialize persistence: store_bets is NOT thread-safe
+                            with self._persist_lock:
+                                store_bets(bets)
                             logging.info(f"action: apuesta_recibida | result: success | cantidad: {len(bets)}")
                             send_line(client_sock, f"ACK_BATCH|OK|{len(bets)}")
                         except Exception as e:
@@ -154,7 +171,9 @@ class Server:
                     agency, nombre, apellido, documento, nacimiento, numero = f[:6]
                     try:
                         b = Bet(agency, nombre, apellido, documento, nacimiento, numero)
-                        store_bets([b])
+                        # Serialize persistence: store_bets is NOT thread-safe
+                        with self._persist_lock:
+                            store_bets([b])
                         logging.info(f"action: apuesta_almacenada | result: success | dni: {b.document} | numero: {b.number}")
                         send_line(client_sock, "ACK|OK")
                     except Exception as e:
@@ -171,16 +190,11 @@ class Server:
                 client_sock.close()
             except OSError:
                 pass
-            
+
     def __accept_new_connection(self):
         """
         Accept new connections
-
-        Function blocks until a connection to a client is made.
-        Then connection created is printed and returned
         """
-
-        # Connection arrived
         logging.info('action: accept_connections | result: in_progress')
         c, addr = self._server_socket.accept()
         logging.info(f'action: accept_connections | result: success | ip: {addr[0]}')
@@ -192,32 +206,46 @@ class Server:
             self._server_socket.close()
         except OSError:
             pass
-        # Best effort join outside lock to avoid deadlocks
-        workers = []
-        with self._lock:
+        # Best effort join
+        with self._workers_lock:
             workers = list(self._workers)
         for t in workers:
             t.join(timeout=2.0)
-            
+
     def _perform_draw_if_ready(self):
-        with self._lock:
+        """
+        Run the draw once all expected agencies have sent DONE.
+        Locking strategy:
+          - Check readiness under _state_lock.
+          - Take a consistent snapshot under _persist_lock (load_bets, has_won).
+          - Publish results under _state_lock.
+        """
+        # 1) Check readiness
+        with self._state_lock:
             if self._draw_completed:
                 return
-            if not self._expected_agencies:
+            expected = self._expected_agencies
+            if not expected:
                 return
-            if len(self._done_agencies) < self._expected_agencies:
+            if len(self._done_agencies) < expected:
                 return
 
-            winners = {}
-            try:
-                # load_bets is NOT thread-safe → safe because we hold the lock
+        # 2) Build winners snapshot from persisted bets (serialize with persistence lock)
+        try:
+            with self._persist_lock:
+                winners = {}
                 for bet in load_bets():
                     if has_won(bet):
                         winners.setdefault(str(bet.agency), []).append(str(bet.document))
-            except Exception as e:
-                logging.error(f"action: sorteo | result: fail | error: {e}")
-                return
+        except Exception as e:
+            logging.error(f"action: sorteo | result: fail | error: {e}")
+            return
 
+        # 3) Publish results
+        with self._state_lock:
+            if self._draw_completed:
+                return
             self._winners_by_agency = winners
             self._draw_completed = True
+
         logging.info("action: sorteo | result: success")
