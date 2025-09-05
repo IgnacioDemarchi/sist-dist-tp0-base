@@ -61,8 +61,19 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     
-    server.run()
-
+    try:
+        server.run()
+    finally:
+        # Idempotent; safe to call multiple times
+        server.stop()
+        logging.info("action: shutdown | result: success")
+        # Optional: flush logs before exit
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+            
 def initialize_log(logging_level):
     """
     Python custom logging initialization

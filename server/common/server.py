@@ -2,6 +2,7 @@ import socket
 import logging
 import os
 import threading
+import signal
 from common.comm import recv_line, send_line
 from common.utils import Bet, store_bets, load_bets, has_won
 class Server:
@@ -42,7 +43,43 @@ class Server:
         self._workers = set()
         self._max_workers = 64
 
+        # Internal flag to avoid double-installing handlers
+        self._signals_installed = False
+
+    def _install_signal_handlers(self):
+        """
+        Install SIGTERM/SIGINT handlers in the main thread so workers can
+        stop gracefully. Safe to call multiple times; only installs once.
+        """
+        if self._signals_installed:
+            return
+        try:
+            if threading.current_thread() is threading.main_thread():
+                # Ignore SIGPIPE (defensive; some environments may raise it)
+                try:
+                    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+                except Exception:
+                    pass
+
+                def _graceful_stop(signum, frame):
+                    logging.info(f"action: signal | result: received | signum: {signum}")
+                    self.stop()
+
+                signal.signal(signal.SIGTERM, _graceful_stop)
+                signal.signal(signal.SIGINT, _graceful_stop)
+                logging.debug("action: signal_handlers | result: installed")
+                self._signals_installed = True
+            else:
+                logging.debug("action: signal_handlers | result: skipped | reason: not_main_thread")
+        except ValueError:
+            logging.debug("action: signal_handlers | result: skipped | reason: not_in_main_thread")
+        except Exception as e:
+            logging.warning(f"action: signal_handlers | result: fail | error: {e}")
+
     def run(self):
+        # Ensure signal handlers are in place when run() is invoked from main thread
+        self._install_signal_handlers()
+
         while not self._stopping:
             try:
                 client_sock = self.__accept_new_connection()
@@ -69,6 +106,8 @@ class Server:
                 )
                 self._workers.add(t)
             t.start()
+
+        self.stop()
 
     def _reap_workers(self):
         # Remove finished threads from the set
